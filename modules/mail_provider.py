@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from .storage import MailAccount
-from .utils import PROJECT_ROOT, extract_code, extract_codes, load_env, log
+from .utils import PROJECT_ROOT, env_bool, extract_code, extract_codes, load_env, log
 
 
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -57,6 +57,41 @@ EXTERNAL_IMAP163_DIR_ENV = "EXTERNAL_IMAP163_DIR"
 DEFAULT_EXTERNAL_IMAP163_DIR = ""
 
 
+def _resolve_project_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def configured_mail_http_proxy() -> str | None:
+    env = load_env(".env")
+    mail_proxy_enabled = env_bool(env.get("MAIL_USE_PROXY"), default=env_bool(env.get("USE_PROXY"), default=False))
+    if not mail_proxy_enabled:
+        return None
+
+    proxy = (env.get("MAIL_PROXY") or env.get("HTTPS_PROXY") or env.get("HTTP_PROXY") or "").strip()
+    if not proxy:
+        proxy_file = _resolve_project_path(env.get("MAIL_PROXY_FILE") or env.get("PROXY_FILE") or "data/proxies/proxies.txt")
+        if proxy_file.exists():
+            for raw_line in proxy_file.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                line = raw_line.strip()
+                if line and not line.startswith("#"):
+                    proxy = line
+                    break
+    if not proxy:
+        return None
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    return proxy
+
+
+def mail_http_client(*, timeout: float | int = 30, follow_redirects: bool = False) -> httpx.AsyncClient:
+    proxy = configured_mail_http_proxy()
+    kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": follow_redirects}
+    if proxy:
+        kwargs["proxy"] = proxy
+    return httpx.AsyncClient(**kwargs)
+
+
 def is_appleemail_nonrecoverable_error(message: str) -> bool:
     text = str(message or "")
     lowered = text.lower()
@@ -73,18 +108,34 @@ def is_appleemail_nonrecoverable_error(message: str) -> bool:
 
 
 class MailProvider:
-    def __init__(self, source: str, timeout_sec: int, poll_interval_sec: int, log_prefix: str = ""):
+    def __init__(
+        self,
+        source: str,
+        timeout_sec: int,
+        poll_interval_sec: int,
+        log_prefix: str = "",
+        verification_sender: str = "openai",
+    ):
         self.source = source
         self.timeout_sec = timeout_sec
         self.poll_interval_sec = poll_interval_sec
         self.log_prefix = log_prefix
+        self.verification_sender = (verification_sender or "openai").strip().lower()
 
     def log(self, message: str) -> None:
         log(f"{self.log_prefix} {message}".strip())
 
-    async def wait_code(self, account: MailAccount, since: datetime, exclude: set[str] | None = None) -> str:
+    async def wait_code(
+        self,
+        account: MailAccount,
+        since: datetime,
+        exclude: set[str] | None = None,
+        *,
+        timeout_sec: int | None = None,
+    ) -> str:
         exclude = exclude or set()
-        self.log(f"开始等待邮箱验证码: {account.email} | 排除旧码数={len(exclude)}")
+        wait_sec = int(timeout_sec if timeout_sec is not None else self.timeout_sec)
+        self.log(f"开始等待邮箱验证码: {account.email} | 排除旧码数={len(exclude)} | 超时={wait_sec}s")
         if account.mail_url:
             code = await wait_code_with_legacy_adapter(
                 account.mail_url,
@@ -95,7 +146,7 @@ class MailProvider:
             )
             self.log(f"已通过旧版接码适配器获取验证码: {code}")
             return code
-        deadline = asyncio.get_running_loop().time() + self.timeout_sec
+        deadline = asyncio.get_running_loop().time() + wait_sec
         last_error: str | None = None
         while asyncio.get_running_loop().time() < deadline:
             try:
@@ -112,6 +163,16 @@ class MailProvider:
             await asyncio.sleep(self.poll_interval_sec)
         raise TimeoutError(f"验证码等待超时: {last_error or '没有新验证码'}")
 
+    async def snapshot_existing_codes(self, account: MailAccount) -> set[str]:
+        return await collect_existing_verification_codes(account, self.verification_sender)
+
+    async def snapshot_codes_before(self, account: MailAccount, before: datetime) -> set[str]:
+        return await collect_existing_verification_codes(
+            account,
+            self.verification_sender,
+            before=before,
+        )
+
     async def fetch_code(self, account: MailAccount, since: datetime, exclude: set[str] | None = None) -> str | None:
         if account.mail_url:
             return await fetch_mail_url_code(account.mail_url, exclude or set())
@@ -121,11 +182,16 @@ class MailProvider:
             return await fetch_icloud_query_code(account, since, exclude or set())
         if self.source != "hotmail_graph":
             raise RuntimeError(f"当前邮箱来源仅支持 moemail / hotmail_graph / icloud_query，实际配置: {self.source}")
-        return await fetch_hotmail_graph_code(account, since, exclude or set())
+        return await fetch_hotmail_graph_code(
+            account,
+            since,
+            exclude or set(),
+            sender_hint=self.verification_sender,
+        )
 
 
 async def fetch_mail_url_code(mail_url: str, exclude: set[str]) -> str | None:
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with mail_http_client(timeout=30, follow_redirects=True) as client:
         response = await client.get(mail_url)
         if response.status_code >= 400:
             raise RuntimeError(f"接码地址读取失败: HTTP {response.status_code}")
@@ -143,7 +209,7 @@ async def fetch_icloud_query_code(account: MailAccount, since: datetime, exclude
     if not query_code:
         raise RuntimeError("iCloud 查询账号需要 email----查询码 格式")
     since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with mail_http_client(timeout=30, follow_redirects=True) as client:
         response = await client.post(
             f"{ICLOUD_THEFINDNET_BASE_URL}/public/search-emails.php",
             json={"credentials": f"{account.email}----{query_code}"},
@@ -298,7 +364,7 @@ async def wait_code_with_external_imap163(
     if code in exclude:
         log("[mail] 外部 imap163 返回的是已尝试旧验证码，继续等待新验证码")
     return ""
-def choose_mail_code(text: str, exclude: set[str]) -> str | None:
+def choose_mail_code(text: str, exclude: set[str], sender_hint: str = "openai") -> str | None:
     normalized = re.sub(r"\s+", " ", text)
     priority_patterns = [
         r"自动识别验证码[^0-9]{0,80}(?:openai|chatgpt)?[^0-9]{0,80}(\d{6})",
@@ -307,6 +373,15 @@ def choose_mail_code(text: str, exclude: set[str]) -> str | None:
         r"临时验证码[^0-9]{0,80}(\d{6})",
         r"verification code[^0-9]{0,80}(\d{6})",
     ]
+    if sender_hint in {"cursor", "any"}:
+        priority_patterns = [
+            r"(?:cursor|anysphere|authenticator\.cursor)[^0-9]{0,120}(\d{6})",
+            r"your (?:cursor )?verification code[^0-9]{0,80}(\d{6})",
+            r"sign in to cursor[^0-9]{0,120}(\d{6})",
+            r"登录 cursor[^0-9]{0,120}(\d{6})",
+            r"verification code[^0-9]{0,80}(\d{6})",
+            r"验证码[^0-9]{0,80}(\d{6})",
+        ] + priority_patterns
     for pattern in priority_patterns:
         for code in re.findall(pattern, normalized, flags=re.I):
             if code not in exclude:
@@ -337,12 +412,228 @@ def parse_icloud_time(item: dict[str, Any]) -> datetime | None:
     return None
 
 
-async def fetch_hotmail_graph_code(account: MailAccount, since: datetime, exclude: set[str]) -> str | None:
+def _since_floor(since: datetime) -> datetime:
+    since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    return since_utc - HOTMAIL_CODE_TIME_SKEW
+
+
+def _pick_newest_code(
+    candidates: list[tuple[datetime, str]],
+    exclude: set[str],
+    *,
+    since_floor: datetime | None = None,
+) -> str | None:
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _, code in candidates:
+        if code not in exclude:
+            return code
+    if since_floor is not None:
+        for received, code in candidates:
+            if code in exclude and received >= since_floor:
+                return code
+    return None
+
+
+async def collect_existing_verification_codes(
+    account: MailAccount,
+    sender_hint: str = "openai",
+    lookback: timedelta = timedelta(hours=48),
+    *,
+    before: datetime | None = None,
+) -> set[str]:
+    since = datetime.now(timezone.utc) - lookback
+    before_cutoff = _since_floor(before) if before is not None else None
+    found: set[str] = set()
+    if account.email.lower() not in _APPLEEMAIL_UNAVAILABLE:
+        try:
+            found.update(
+                await _collect_appleemail_codes(
+                    account, since, sender_hint, before_cutoff=before_cutoff
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"快照历史验证码(小苹果 API)失败: {exc}")
+    try:
+        found.update(
+            await _collect_hotmail_imap_codes(
+                account, since, sender_hint, before_cutoff=before_cutoff
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"快照历史验证码(IMAP)失败: {exc}")
+    if account.client_id and account.refresh_token:
+        try:
+            token = await refresh_graph_access_token(account.client_id, account.refresh_token)
+            found.update(
+                await _collect_graph_codes(token, since, sender_hint, before_cutoff=before_cutoff)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"快照历史验证码(Graph)失败: {exc}")
+    return found
+
+
+async def _collect_appleemail_codes(
+    account: MailAccount,
+    since: datetime,
+    sender_hint: str,
+    *,
+    before_cutoff: datetime | None = None,
+) -> set[str]:
+    if not account.client_id or not account.refresh_token:
+        return set()
+    since_floor = _since_floor(since)
+    found: set[str] = set()
+    async with mail_http_client(timeout=HOTMAIL_APPLEEMAIL_HTTP_TIMEOUT_SEC, follow_redirects=True) as client:
+        for mailbox in APPLEEMAIL_MAILBOXES:
+            payload = {
+                "refresh_token": account.refresh_token,
+                "client_id": account.client_id,
+                "email": account.email,
+                "mailbox": mailbox,
+                "response_type": "json",
+            }
+            url = f"{APPLEEMAIL_BASE_URL}/api/mail-all"
+            response = await client.post(
+                url,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json=payload,
+            )
+            if response.status_code == 405:
+                response = await client.get(url, params=payload, headers={"Accept": "application/json"})
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code} {response.text[:160]}")
+            data = response.json()
+            if appleemail_unavailable(data):
+                raise RuntimeError(f"小苹果 API 不支持或无权限访问该邮箱: {appleemail_error_message(data)}")
+            for item in normalize_appleemail_messages(data):
+                received = parse_appleemail_time(item)
+                if received and received < since_floor:
+                    continue
+                if before_cutoff and received and received >= before_cutoff:
+                    continue
+                text = appleemail_message_text(item)
+                if not looks_like_verification_mail(text, sender_hint=sender_hint):
+                    continue
+                code = extract_code(text)
+                if code:
+                    found.add(code)
+    return found
+
+
+async def _collect_graph_codes(
+    token: str,
+    since: datetime,
+    sender_hint: str,
+    *,
+    before_cutoff: datetime | None = None,
+) -> set[str]:
+    since_floor = _since_floor(since)
+    found: set[str] = set()
+    messages = await list_recent_messages(token)
+    for item in messages:
+        received = parse_graph_time(item.get("receivedDateTime"))
+        if received and received < since_floor:
+            continue
+        if before_cutoff and received and received >= before_cutoff:
+            continue
+        sender = (((item.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+        subject = item.get("subject") or ""
+        preview = item.get("bodyPreview") or ""
+        body = ((item.get("body") or {}).get("content") or "")
+        text = f"{sender}\n{subject}\n{preview}\n{body}"
+        if not looks_like_verification_mail(text, sender_hint=sender_hint):
+            continue
+        code = extract_code(text)
+        if code:
+            found.add(code)
+    return found
+
+
+async def _collect_hotmail_imap_codes(
+    account: MailAccount,
+    since: datetime,
+    sender_hint: str,
+    *,
+    before_cutoff: datetime | None = None,
+) -> set[str]:
+    access_token = await get_imap_access_token(account.client_id or "", account.refresh_token or "")
+    return await asyncio.to_thread(
+        collect_hotmail_imap_codes_sync,
+        account.email,
+        access_token,
+        since,
+        sender_hint,
+        before_cutoff,
+    )
+
+
+def collect_hotmail_imap_codes_sync(
+    email: str,
+    access_token: str,
+    since: datetime,
+    sender_hint: str = "openai",
+    before_cutoff: datetime | None = None,
+) -> set[str]:
+    since_floor = _since_floor(since)
+    found: set[str] = set()
+    date_filter = since_floor.strftime("%d-%b-%Y")
+    auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
+    with imaplib.IMAP4_SSL(OUTLOOK_IMAP_HOST, 993) as conn:
+        conn.authenticate("XOAUTH2", lambda _response: auth_string.encode("utf-8"))
+        for mailbox in HOTMAIL_IMAP_MAILBOXES:
+            try:
+                select_status, _ = conn.select(mailbox, readonly=True)
+            except Exception:
+                continue
+            if select_status != "OK":
+                continue
+            status, data = conn.search(None, "SINCE", date_filter)
+            if status != "OK":
+                continue
+            ids = (data[0] or b"").split()
+            for message_id in reversed(ids[-40:]):
+                status, fetched = conn.fetch(message_id, "(BODY.PEEK[] INTERNALDATE)")
+                if status != "OK":
+                    continue
+                raw_message = b""
+                internal_date = None
+                for item in fetched:
+                    if not isinstance(item, tuple):
+                        continue
+                    metadata, payload = item
+                    raw_message += payload or b""
+                    match = re.search(rb'INTERNALDATE "([^"]+)"', metadata or b"")
+                    if match:
+                        try:
+                            internal_date = parsedate_to_datetime(match.group(1).decode("ascii", errors="ignore"))
+                        except Exception:
+                            internal_date = None
+                if internal_date and internal_date < since_floor:
+                    continue
+                if before_cutoff and internal_date and internal_date >= before_cutoff:
+                    continue
+                text = decode_imap_message(raw_message)
+                if not looks_like_verification_mail(text, sender_hint=sender_hint):
+                    continue
+                code = extract_code(text)
+                if code:
+                    found.add(code)
+    return found
+
+
+async def fetch_hotmail_graph_code(
+    account: MailAccount,
+    since: datetime,
+    exclude: set[str],
+    sender_hint: str = "openai",
+) -> str | None:
     if not account.client_id or not account.refresh_token:
         raise RuntimeError("Hotmail Graph 需要 email----password----client_id----refresh_token 格式")
     if account.email.lower() not in _APPLEEMAIL_UNAVAILABLE:
         try:
-            code = await fetch_appleemail_code(account, since, exclude)
+            code = await fetch_appleemail_code(account, since, exclude, sender_hint=sender_hint)
             if code:
                 return code
         except Exception as exc:  # noqa: BLE001
@@ -351,7 +642,7 @@ async def fetch_hotmail_graph_code(account: MailAccount, since: datetime, exclud
             log(f"AppleEmail API 取码失败，继续尝试 Outlook IMAP: {exc}")
     imap_error = ""
     try:
-        code = await fetch_hotmail_imap_code(account, since, exclude)
+        code = await fetch_hotmail_imap_code(account, since, exclude, sender_hint=sender_hint)
         if code:
             return code
     except Exception as exc:  # noqa: BLE001
@@ -366,29 +657,36 @@ async def fetch_hotmail_graph_code(account: MailAccount, since: datetime, exclud
             raise RuntimeError("hotmail_oauth_invalid_grant: IMAP 和 Graph OAuth 均失效")
         return None
     messages = await list_recent_messages(token)
+    candidates: list[tuple[datetime, str]] = []
+    since_floor = _since_floor(since)
     for item in messages:
         received = parse_graph_time(item.get("receivedDateTime"))
-        if received and received < since:
+        if received and received < since_floor:
             continue
         sender = (((item.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
         subject = item.get("subject") or ""
         preview = item.get("bodyPreview") or ""
         body = ((item.get("body") or {}).get("content") or "")
         text = f"{sender}\n{subject}\n{preview}\n{body}"
-        if not looks_like_openai_mail(text):
+        if not looks_like_verification_mail(text, sender_hint=sender_hint):
             continue
         code = extract_code(text)
-        if code and code not in exclude:
-            return code
-    return None
+        if code:
+            sort_ts = received or datetime.min.replace(tzinfo=timezone.utc)
+            candidates.append((sort_ts, code))
+    return _pick_newest_code(candidates, exclude, since_floor=since_floor)
 
 
-async def fetch_appleemail_code(account: MailAccount, since: datetime, exclude: set[str]) -> str | None:
+async def fetch_appleemail_code(
+    account: MailAccount,
+    since: datetime,
+    exclude: set[str],
+    sender_hint: str = "openai",
+) -> str | None:
     if not account.client_id or not account.refresh_token:
         return None
-    since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
-    since_floor = since_utc - MAIL_TIME_SKEW
-    async with httpx.AsyncClient(timeout=HOTMAIL_APPLEEMAIL_HTTP_TIMEOUT_SEC, follow_redirects=True) as client:
+    since_floor = _since_floor(since)
+    async with mail_http_client(timeout=HOTMAIL_APPLEEMAIL_HTTP_TIMEOUT_SEC, follow_redirects=True) as client:
         for mailbox in APPLEEMAIL_MAILBOXES:
             payload = {
                 "refresh_token": account.refresh_token,
@@ -416,21 +714,22 @@ async def fetch_appleemail_code(account: MailAccount, since: datetime, exclude: 
                 received = parse_appleemail_time(item)
                 if received and received < since_floor:
                     continue
+                if received is None:
+                    continue
                 text = appleemail_message_text(item)
-                if not looks_like_openai_mail(text):
+                if not looks_like_verification_mail(text, sender_hint=sender_hint):
                     continue
                 code = extract_code(text)
-                if code and code not in exclude:
+                if code:
                     sort_ts = received or datetime.min.replace(tzinfo=timezone.utc)
                     candidates.append((sort_ts, code))
-                elif code and code in exclude:
-                    log(f"小苹果 API 命中验证码但在排除列表中，等待更新: {code}")
-            if candidates:
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                newest_ts, newest_code = candidates[0]
-                log(f"已从小苹果 API 提取验证码: {newest_code} (time={newest_ts.isoformat()})")
-                return newest_code
-            log(f"小苹果 API {mailbox} 暂未找到 OpenAI 新验证码: {account.email}")
+            newest = _pick_newest_code(candidates, exclude, since_floor=since_floor)
+            if newest:
+                newest_ts = next(ts for ts, c in candidates if c == newest)
+                log(f"已从小苹果 API 提取验证码: {newest} (time={newest_ts.isoformat()})")
+                return newest
+            brand = "Cursor" if sender_hint == "cursor" else "OpenAI"
+            log(f"小苹果 API {mailbox} 暂未找到 {brand} 新验证码: {account.email}")
     return None
 
 
@@ -526,9 +825,21 @@ def parse_appleemail_time(item: dict[str, Any]) -> datetime | None:
     return None
 
 
-async def fetch_hotmail_imap_code(account: MailAccount, since: datetime, exclude: set[str]) -> str | None:
+async def fetch_hotmail_imap_code(
+    account: MailAccount,
+    since: datetime,
+    exclude: set[str],
+    sender_hint: str = "openai",
+) -> str | None:
     access_token = await get_imap_access_token(account.client_id or "", account.refresh_token or "")
-    return await asyncio.to_thread(fetch_hotmail_imap_code_sync, account.email, access_token, since, exclude)
+    return await asyncio.to_thread(
+        fetch_hotmail_imap_code_sync,
+        account.email,
+        access_token,
+        since,
+        exclude,
+        sender_hint,
+    )
 
 
 async def get_imap_access_token(client_id: str, refresh_token: str) -> str:
@@ -545,7 +856,7 @@ async def get_imap_access_token(client_id: str, refresh_token: str) -> str:
         "refresh_token": cached.refresh_token if cached else refresh_token,
         "scope": IMAP_TOKEN_SCOPE,
     }
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with mail_http_client(timeout=30) as client:
         response = await client.post(GRAPH_TOKEN_URL, data=data)
         if response.status_code >= 400:
             raise RuntimeError(f"IMAP OAuth 刷新 token 失败: HTTP {response.status_code} {response.text[:200]}")
@@ -562,10 +873,18 @@ async def get_imap_access_token(client_id: str, refresh_token: str) -> str:
     return access_token
 
 
-def fetch_hotmail_imap_code_sync(email: str, access_token: str, since: datetime, exclude: set[str]) -> str | None:
+def fetch_hotmail_imap_code_sync(
+    email: str,
+    access_token: str,
+    since: datetime,
+    exclude: set[str],
+    sender_hint: str = "openai",
+) -> str | None:
+    since_floor = _since_floor(since)
     since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
-    date_filter = since_utc.strftime("%d-%b-%Y")
+    date_filter = since_floor.strftime("%d-%b-%Y")
     auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
+    candidates: list[tuple[datetime, str]] = []
     with imaplib.IMAP4_SSL(OUTLOOK_IMAP_HOST, 993) as conn:
         conn.authenticate("XOAUTH2", lambda _response: auth_string.encode("utf-8"))
         for mailbox in HOTMAIL_IMAP_MAILBOXES:
@@ -596,17 +915,19 @@ def fetch_hotmail_imap_code_sync(email: str, access_token: str, since: datetime,
                             internal_date = parsedate_to_datetime(match.group(1).decode("ascii", errors="ignore"))
                         except Exception:
                             internal_date = None
-                if internal_date and internal_date < since_utc:
+                if internal_date and internal_date < since_floor:
                     continue
                 text = decode_imap_message(raw_message)
-                if not looks_like_openai_mail(text):
+                if not looks_like_verification_mail(text, sender_hint=sender_hint):
                     continue
                 code = extract_code(text)
-                if code and code not in exclude:
-                    log(f"已从 Outlook IMAP({mailbox}) 提取验证码: {code}")
-                    return code
-                if code and code in exclude:
-                    log(f"Outlook IMAP({mailbox}) 命中验证码但在排除列表中，等待更新: {code}")
+                if code:
+                    sort_ts = internal_date or since_utc
+                    candidates.append((sort_ts, code))
+    newest = _pick_newest_code(candidates, exclude, since_floor=since_floor)
+    if newest:
+        log(f"已从 Outlook IMAP 提取验证码: {newest}")
+        return newest
     return None
 
 
@@ -678,7 +999,7 @@ async def refresh_graph_access_token(client_id: str, refresh_token: str) -> str:
         "refresh_token": refresh_token,
         "scope": "offline_access Mail.Read User.Read",
     }
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with mail_http_client(timeout=30) as client:
         response = await client.post(GRAPH_TOKEN_URL, data=data)
         if response.status_code >= 400:
             raise RuntimeError(f"Graph 刷新 token 失败: HTTP {response.status_code} {response.text[:200]}")
@@ -696,7 +1017,7 @@ async def list_recent_messages(access_token: str) -> list[dict[str, Any]]:
         "$select": "subject,bodyPreview,body,from,receivedDateTime",
     }
     headers = {"Authorization": f"Bearer {access_token}"}
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with mail_http_client(timeout=30) as client:
         all_messages: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         endpoints = (
@@ -738,32 +1059,54 @@ def parse_graph_time(value: str | None) -> datetime | None:
             return None
 
 
-def looks_like_openai_mail(text: str) -> bool:
+OPENAI_SENDER_HINTS = (
+    "openai",
+    "chatgpt",
+    "account-security",
+    "noreply@openai.com",
+    "info@account.openai.com",
+    "auth0.openai.com",
+)
+
+CURSOR_SENDER_HINTS = (
+    "cursor.com",
+    "cursor.sh",
+    "authenticator.cursor",
+    "anysphere",
+    "noreply@cursor",
+    "no-reply@cursor",
+    "workos",
+    "cursor authentication",
+    "sign in to cursor",
+    "登录 cursor",
+)
+
+CODE_HINTS = (
+    "code",
+    "verification",
+    "verify",
+    "one-time",
+    "otp",
+    "验证码",
+    "临时验证码",
+    "登录代码",
+    "安全代码",
+)
+
+
+def looks_like_verification_mail(text: str, sender_hint: str = "openai") -> bool:
     low = text.lower()
-    has_sender_hint = any(
-        key in low
-        for key in [
-            "openai",
-            "chatgpt",
-            "account-security",
-            "noreply@openai.com",
-            "info@account.openai.com",
-            "auth0.openai.com",
-        ]
-    )
-    has_code_hint = any(
-        key in low
-        for key in [
-            "code",
-            "verification",
-            "verify",
-            "one-time",
-            "otp",
-            "验证码",
-            "临时验证码",
-            "登录代码",
-            "安全代码",
-        ]
-    )
+    if sender_hint == "cursor":
+        sender_keys = CURSOR_SENDER_HINTS
+    elif sender_hint == "openai":
+        sender_keys = OPENAI_SENDER_HINTS
+    else:
+        sender_keys = CURSOR_SENDER_HINTS + OPENAI_SENDER_HINTS
+    has_sender_hint = any(key in low for key in sender_keys)
+    has_code_hint = any(key in low for key in CODE_HINTS)
     return has_sender_hint and has_code_hint
+
+
+def looks_like_openai_mail(text: str) -> bool:
+    return looks_like_verification_mail(text, sender_hint="openai")
 

@@ -2177,6 +2177,7 @@ async def pay_one(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        incognito=bool(browser_cfg.get("incognito", False)),
         fingerprint_seed=email,
     )
 

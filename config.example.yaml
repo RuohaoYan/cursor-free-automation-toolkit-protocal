@@ -1,5 +1,6 @@
 browser:
-  headless: false
+  headless: false  # 也可用 .env 的 BROWSER_HEADLESS=true 覆盖
+  incognito: false
   slow_mo: 80
   timeout_ms: 60000
   use_proxy: false
@@ -50,6 +51,10 @@ mail_sources:
 register_profile:
   age_min: 21
   age_max: 45
+
+cursor:
+  signup_url: "https://cursor.com/"
+  output_dir: "output/cursor注册"
 
 output:
   success_file: "output/流程1_注册成功长链接.txt"

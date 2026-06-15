@@ -23,6 +23,17 @@ class ManualInterventionNeeded(RuntimeError):
     pass
 
 
+AUTH_RETRY_ERROR_HINTS = (
+    "route error",
+    "invalid content type",
+    "糟糕，出错了",
+    "oops, an error occurred",
+    "something went wrong",
+)
+
+AUTH_RETRY_BUTTON_TEXTS = ("重试", "再试一次", "Retry", "Try again")
+
+
 class ChatGPTRegister:
     def __init__(
         self,
@@ -50,6 +61,7 @@ class ChatGPTRegister:
         self.bad_codes: set[str] = set()
         self.unknown_count = 0
         self.entry_count = 0
+        self.auth_error_retry_count = 0
 
     def log(self, message: str) -> None:
         log(f"{self.log_prefix} {message}".strip())
@@ -64,7 +76,10 @@ class ChatGPTRegister:
                 state = await self.detect_state()
                 self.log(f"注册状态[{step}]: {state} | url={short_url(self.page.url)}")
                 if state == "fatal_account_error":
+                    if await self.retry_auth_error_page(max_attempts=2):
+                        continue
                     raise FatalAccountError(await fatal_error_message(self.page))
+                self.auth_error_retry_count = 0
                 if state == "logged_in":
                     self.log("已确认登录成功")
                     return
@@ -138,6 +153,29 @@ class ChatGPTRegister:
     async def refresh_page(self) -> None:
         if self.page_getter:
             self.page = await self.page_getter()
+
+    async def retry_auth_error_page(self, *, max_attempts: int = 2) -> bool:
+        text = await body_text(self.page)
+        reason = recoverable_auth_error_reason(text.lower(), text)
+        if not reason or self.auth_error_retry_count >= max_attempts:
+            return False
+        self.auth_error_retry_count += 1
+        self.log(f"认证错误页({reason})，点击“重试”恢复 ({self.auth_error_retry_count}/{max_attempts})")
+        clicked = await click_auth_retry_button(self.page)
+        if not clicked:
+            self.log("认证错误页未找到“重试”按钮，尝试刷新当前页")
+            try:
+                await self.page.reload(wait_until="domcontentloaded", timeout=20_000)
+            except Exception as exc:
+                self.log(f"刷新认证错误页失败: {short_error_text(exc)}")
+        deadline = asyncio.get_running_loop().time() + 12
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.wait_for_timeout(700)
+            text = await body_text(self.page)
+            if not recoverable_auth_error_reason(text.lower(), text):
+                self.log("认证错误页重试后已恢复")
+                return True
+        return True
 
     async def detect_state(self) -> str:
         url = self.page.url.lower()
@@ -405,7 +443,7 @@ class ChatGPTRegister:
                     raise RuntimeError("手机号注册进入创建密码页，但当前流程未提供密码")
                 self.log("手机号页: 检测到创建密码页，先填入注册密码")
                 await fill_create_password_page(self.page, password, self.log)
-            if not await wait_for_sms_verification_page(self.page, self.log):
+            if await wait_for_sms_verification_page(self.page, self.log) != "sms":
                 self.log("手机号页: 未明确识别到短信验证码页，仍继续尝试拉取验证码")
             self.log(f"手机号页: 开始拉取短信验证码，间隔={poll_interval:g}s，最多={max_attempts}次")
             code = await asyncio.to_thread(
@@ -439,6 +477,7 @@ class ChatGPTRegister:
 
 async def find_phone_input(page: Page) -> Locator | None:
     selectors = (
+        'input[name="local_number"]',
         'input[name="phoneNumberInput"]',
         'input[type="tel"]',
         'input[autocomplete="tel"]',
@@ -456,6 +495,9 @@ async def find_phone_input(page: Page) -> Locator | None:
 
 async def select_phone_country(page: Page, country: PhoneCountry, logger: Callable[[str], None]) -> None:
     if not country.dial_code and not country.iso_code:
+        return
+    if await page_has_split_phone_form(page):
+        logger("手机号页: 分栏表单无需下拉选择国家")
         return
     logger(f"手机号页: 选择国家 {country.name} +{country.dial_code}")
     try:
@@ -515,7 +557,7 @@ async def select_phone_country(page: Page, country: PhoneCountry, logger: Callab
 
     try:
         button = page.locator('button[aria-haspopup="listbox"]').filter(has_text=re.compile(r"\+\(?\d")).first
-        if await button.is_visible(timeout=1000):
+        if await button.count() > 0 and await button.is_visible():
             await button.click(timeout=3000)
             await page.wait_for_timeout(1500)
             target = await page.evaluate(
@@ -601,7 +643,21 @@ async def country_selector_matches(page: Page, country: PhoneCountry) -> bool:
 
 
 async def click_phone_submit(page: Page, field: Locator | None = None) -> bool:
-    clicked = await click_submit_by_js(page, ["继续", "Continue", "Next", "Verify", "Submit", "验证", "下一步"])
+    clicked = await click_submit_by_js(
+        page,
+        [
+            "发送验证码",
+            "Send code",
+            "Send verification code",
+            "继续",
+            "Continue",
+            "Next",
+            "Verify",
+            "Submit",
+            "验证",
+            "下一步",
+        ],
+    )
     if clicked:
         return True
     if field is not None:
@@ -614,12 +670,170 @@ async def click_phone_submit(page: Page, field: Locator | None = None) -> bool:
     return False
 
 
-async def fill_phone_and_wait_sms_page(page: Page, phone: str, country: PhoneCountry, logger: Callable[[str], None]) -> None:
+async def page_has_split_phone_form(page: Page) -> bool:
+    url = (page.url or "").lower()
+    if "radar-challenge" in url:
+        return True
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const cc = document.querySelector('input[name="country_code"]');
+                    const ln = document.querySelector('input[name="local_number"]');
+                    if (!cc || !ln) return false;
+                    const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0
+                            && style.visibility !== 'hidden'
+                            && style.display !== 'none';
+                    };
+                    return visible(cc) && visible(ln);
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def wait_split_phone_form(page: Page, timeout_ms: int = 20_000) -> None:
+    await page.wait_for_selector('input[name="country_code"]', state="visible", timeout=timeout_ms)
+    await page.wait_for_selector('input[name="local_number"]', state="visible", timeout=timeout_ms)
+
+
+async def fill_react_input(locator: Locator, value: str) -> None:
+    await locator.scroll_into_view_if_needed()
+    await locator.click(force=True)
+    await locator.fill("")
+    await locator.fill(str(value))
+    await locator.evaluate(
+        """(el, val) => {
+            const proto = HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(el, val);
+            else el.value = val;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+        }""",
+        str(value),
+    )
+
+
+async def read_input_value(locator: Locator) -> str:
+    try:
+        return (await locator.input_value()).strip()
+    except Exception:
+        return ""
+
+
+async def read_input_value(locator: Locator) -> str:
+    try:
+        return (await locator.input_value()).strip()
+    except Exception:
+        return ""
+
+
+def _phone_digits(value: str) -> str:
+    return re.sub(r"\D+", "", value or "")
+
+
+async def _clear_and_type(locator: Locator, text: str, *, delay_ms: int = 80) -> None:
+    await locator.scroll_into_view_if_needed()
+    await locator.click(force=True)
+    await locator.page.keyboard.press("Control+A")
+    await locator.page.keyboard.press("Backspace")
+    await locator.press_sequentially(str(text), delay=delay_ms)
+
+
+async def _run_before_auto_send(
+    before_auto_send: Callable[[], Awaitable[None] | None] | None,
+) -> None:
+    if before_auto_send is None:
+        return
+    result = before_auto_send()
+    if asyncio.iscoroutine(result):
+        await result
+
+
+async def fill_split_phone_form(
+    page: Page,
+    phone: str,
+    country: PhoneCountry,
+    logger: Callable[[str], None],
+    *,
+    before_auto_send: Callable[[], Awaitable[None] | None] | None = None,
+) -> None:
+    await wait_split_phone_form(page)
+    country_input = page.locator('input[name="country_code"]').first
+    local_input = page.locator('input[name="local_number"]').first
+    dial = re.sub(r"\D+", "", country.dial_code or "")
+    dial_display = f"+{dial}" if dial else "+"
+    local_value = local_phone_number(phone, country)
+    logger(
+        f"手机号页: Cursor 分栏表单 | 区号={dial_display} | 本地号码={local_value} | "
+        f"国家={country.name}(+{country.dial_code or '-'})"
+    )
+
+    await _clear_and_type(country_input, dial_display, delay_ms=60)
+    await page.wait_for_timeout(400)
+    cc_val = await read_input_value(country_input)
+    if _phone_digits(cc_val) != dial:
+        logger(f"手机号页: 区号未生效(当前={cc_val!r})，重试填入")
+        await _clear_and_type(country_input, dial_display, delay_ms=60)
+        cc_val = await read_input_value(country_input)
+
+    await country_input.evaluate("el => el.blur()")
+    await page.wait_for_timeout(300)
+    await _clear_and_type(local_input, local_value, delay_ms=90)
+    await page.wait_for_timeout(500)
+    local_val = await read_input_value(local_input)
+
+    if _phone_digits(local_val) != local_value:
+        logger(f"手机号页: 本地号码未生效(当前={local_val!r})，逐位重试")
+        await local_input.click(force=True)
+        await page.wait_for_timeout(200)
+        await local_input.fill("")
+        await local_input.press_sequentially(local_value, delay=100)
+        await page.wait_for_timeout(500)
+        local_val = await read_input_value(local_input)
+
+    cc_val = await read_input_value(country_input)
+    if _phone_digits(cc_val) != dial:
+        raise RuntimeError(f"区号填入失败: 期望={dial_display}, 实际={cc_val or '(空)'}")
+    if _phone_digits(local_val) != local_value:
+        raise RuntimeError(
+            f"本地号码填入失败: 期望={local_value}, 实际={local_val or '(空)'} "
+            f"(digits={_phone_digits(local_val)})"
+        )
+    logger(f"手机号页: 本地号码已填入 ({local_val})，准备点击提交")
+    await _run_before_auto_send(before_auto_send)
+    if not await click_phone_submit(page, local_input):
+        raise RuntimeError("手机号页: 未找到提交按钮")
+    logger("手机号页: 已点击提交，等待跳转并发送短信验证码")
+    await page.wait_for_timeout(2000)
+
+
+async def fill_phone_and_wait_sms_page(
+    page: Page,
+    phone: str,
+    country: PhoneCountry,
+    logger: Callable[[str], None],
+    *,
+    before_auto_send: Callable[[], Awaitable[None] | None] | None = None,
+) -> None:
     logger(f"手机号页: 准备填入手机号 | 国家={country.name}, ISO={country.iso_code or '-'}, 区号=+{country.dial_code or '-'}")
-    await select_phone_country(page, country, logger)
+    if await page_has_split_phone_form(page):
+        logger("手机号页: 检测到 Cursor 分栏手机表单 (country_code + local_number)")
+        await fill_split_phone_form(page, phone, country, logger, before_auto_send=before_auto_send)
+        return
     phone_input = await find_phone_input(page)
     if not phone_input:
+        url = (page.url or "").lower()
+        if "magic-code" in url:
+            raise RuntimeError("当前为 magic-code 验证码页，不是手机号填写页")
         raise RuntimeError("未找到手机号输入框")
+    await select_phone_country(page, country, logger)
     logger("手机号页: 已找到手机号输入框")
     current_country = await current_phone_country_code(page)
     if country.dial_code and current_country != country.dial_code:
@@ -627,11 +841,12 @@ async def fill_phone_and_wait_sms_page(page: Page, phone: str, country: PhoneCou
     value = local_phone_number(phone, country)
     logger(f"手机号页: 接码号码={phone}，页面国家=+{current_country or '-'}，输入本地号码={value}")
     await human_fill(phone_input, value, force_mouse=True)
-    logger("手机号页: 手机号已填入页面")
+    logger("手机号页: 手机号已填入，准备点击提交")
+    await _run_before_auto_send(before_auto_send)
     if not await click_phone_submit(page, phone_input):
-        raise RuntimeError("手机号提交按钮点击失败")
-    logger("手机号页: 已点击继续/提交，等待短信验证码页")
-    await page.wait_for_timeout(3000)
+        raise RuntimeError("手机号页: 未找到提交按钮")
+    logger("手机号页: 已点击提交，等待跳转并发送短信验证码")
+    await page.wait_for_timeout(2000)
 
 
 async def find_sms_code_input(page: Page) -> Locator | None:
@@ -653,7 +868,7 @@ async def find_sms_code_input(page: Page) -> Locator | None:
                 if not await locator.is_visible(timeout=400):
                     continue
                 name = await locator.get_attribute("name", timeout=400) or ""
-                if name == "phoneNumberInput":
+                if name in {"phoneNumberInput", "local_number", "country_code"}:
                     continue
                 return locator
             except Exception:
@@ -661,26 +876,54 @@ async def find_sms_code_input(page: Page) -> Locator | None:
     return None
 
 
+async def page_is_phone_verification_rate_limited(page: Page) -> bool:
+    text = await body_text(page)
+    low = text.lower()
+    hints = (
+        "此手机号码的验证请求过多",
+        "手机号码的验证请求过多",
+        "该手机号码的验证请求过多",
+        "too many verification requests for this phone",
+        "too many requests for this phone number",
+    )
+    if any(h in text or h in low for h in hints):
+        return True
+    return "验证请求过多" in text and "管理员" in text
+
+
 async def page_looks_like_sms_verification(page: Page) -> bool:
     lower_url = (page.url or "").lower()
     if "contact-verification" in lower_url or "phone-verification" in lower_url:
+        return True
+    if "radar-challenge" in lower_url and "/send" not in lower_url:
         return True
     text = (await body_text(page)).lower()
     return bool(await find_sms_code_input(page) and any(hint in text for hint in ("sms", "text message", "verification code", "验证码", "短信")))
 
 
-async def wait_for_sms_verification_page(page: Page, logger: Callable[[str], None], timeout: int = 45) -> bool:
+async def wait_for_sms_verification_page(
+    page: Page,
+    logger: Callable[[str], None],
+    timeout: int = 45,
+) -> str:
+    """等待短信验证码页。返回 sms | password | rate_limited | timeout。"""
     for index in range(max(1, timeout)):
+        if await page_is_phone_verification_rate_limited(page):
+            logger(
+                "手机号页: 检测到「此手机号码的验证请求过多，请联系您的管理员」，"
+                "未进入短信验证码页"
+            )
+            return "rate_limited"
         if await page_looks_like_create_password(page):
             logger(f"手机号页: 当前是创建密码页，不是短信验证码页 url={short_url(page.url)}")
-            return False
+            return "password"
         if await page_looks_like_sms_verification(page):
             logger("手机号页: 页面已进入短信验证码阶段")
-            return True
+            return "sms"
         if index == 0 or (index + 1) % 5 == 0:
             logger(f"手机号页: 等待短信验证码输入页出现... url={short_url(page.url)}")
         await page.wait_for_timeout(1000)
-    return False
+    return "timeout"
 
 
 async def page_looks_like_create_password(page: Page) -> bool:
@@ -707,11 +950,16 @@ async def fill_create_password_page(page: Page, password: str, logger: Callable[
 
 
 async def fill_sms_code(page: Page, code: str, logger: Callable[[str], None]) -> None:
+    from .utils import extract_code
+
+    digits = extract_code(code) or re.sub(r"\D+", "", code or "")
+    if not digits:
+        raise RuntimeError(f"无法从短信提取验证码: {code}")
     code_input = await find_sms_code_input(page)
     if not code_input:
         raise RuntimeError("未找到短信验证码输入框")
-    logger(f"手机号页: 已找到短信验证码输入框，填入验证码 {code}")
-    await human_fill(code_input, code, force_mouse=True)
+    logger(f"手机号页: 已找到短信验证码输入框，填入验证码 {digits}")
+    await human_fill(code_input, digits, force_mouse=True)
     logger("手机号页: 短信验证码已填入页面")
     if not await click_phone_submit(page, code_input):
         raise RuntimeError("短信验证码提交按钮点击失败")
@@ -837,6 +1085,18 @@ async def is_invalid_code_page(page: Page) -> bool:
     )
 
 
+def recoverable_auth_error_reason(low: str, text: str) -> str:
+    haystack = f"{low} {text}".lower()
+    for hint in AUTH_RETRY_ERROR_HINTS:
+        if hint.lower() not in haystack:
+            continue
+        if hint.lower() in {"something went wrong", "oops, an error occurred"}:
+            if not any(k.lower() in haystack for k in AUTH_RETRY_BUTTON_TEXTS):
+                continue
+        return hint
+    return ""
+
+
 def is_fatal_account_error(low: str, text: str) -> bool:
     return any(
         key in low
@@ -846,6 +1106,72 @@ def is_fatal_account_error(low: str, text: str) -> bool:
             "verification failed",
         ]
     ) or any(key in text for key in ["验证过程中出错", "糟糕，出错了", "请重试"])
+
+
+async def click_auth_retry_button(page: Page) -> bool:
+    selectors = [
+        'button:has-text("重试")',
+        'button:has-text("再试一次")',
+        '[role="button"]:has-text("重试")',
+        '[role="button"]:has-text("再试一次")',
+        'button:has-text("Retry")',
+        '[role="button"]:has-text("Retry")',
+        'button:has-text("Try again")',
+        '[role="button"]:has-text("Try again")',
+        '[aria-label*="重试"]',
+        '[title*="重试"]',
+        'input[type="button"][value*="重试"]',
+        'input[type="submit"][value*="重试"]',
+    ]
+    for selector in selectors:
+        try:
+            items = page.locator(selector)
+            count = min(await items.count(), 6)
+            for index in range(count - 1, -1, -1):
+                item = items.nth(index)
+                if await item.is_visible(timeout=500) and await item.is_enabled(timeout=500):
+                    await item.click(timeout=3000)
+                    return True
+        except Exception:
+            continue
+    try:
+        button = page.get_by_role("button", name=re.compile(r"^(重试|再试一次|Retry|Try again)$", re.I)).last
+        if await button.is_visible(timeout=1000) and await button.is_enabled(timeout=1000):
+            await button.click(timeout=3000)
+            return True
+    except Exception:
+        pass
+    try:
+        clicked = await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 10 || r.height < 10) return false;
+                    const s = window.getComputedStyle(el);
+                    return s && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || '1') > 0.05;
+                };
+                const keys = ['重试', '再试一次', 'retry', 'try again'];
+                const nodes = Array.from(document.querySelectorAll(
+                    'button, [role="button"], a, input[type="button"], input[type="submit"], div[role="button"], span'
+                ));
+                for (let i = nodes.length - 1; i >= 0; i--) {
+                    const el = nodes[i];
+                    if (!visible(el)) continue;
+                    const t = ((el.innerText || el.textContent || el.value || '') + '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                    if (!t || !keys.some((k) => t.includes(k))) continue;
+                    const target = el.closest('button,[role="button"],a,input[type="button"],input[type="submit"],div[role="button"]') || el;
+                    try {
+                        target.click();
+                        return true;
+                    } catch {}
+                }
+                return false;
+            }"""
+        )
+        return bool(clicked)
+    except Exception:
+        return False
 
 
 async def fatal_error_message(page: Page) -> str:

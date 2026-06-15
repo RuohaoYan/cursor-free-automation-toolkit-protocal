@@ -417,6 +417,27 @@ socks5://user:pass@ip:port
 ip:port
 ```
 
+### Q: 如何使用 Kookeey 动态住宅代理？
+
+在 `.env` 中同时开启 `USE_PROXY=true` 与 `RESIDENTIAL_PROXY_ENABLED=true`，并填写 Kookeey 凭据：
+
+```env
+USE_PROXY=true
+RESIDENTIAL_PROXY_ENABLED=true
+RESIDENTIAL_PROXY_SERVER=gate.kookeey.info
+RESIDENTIAL_PROXY_PORT=1000
+RESIDENTIAL_PROXY_TYPE=http
+RESIDENTIAL_PROXY_USERNAME=7522228-b23b5580
+RESIDENTIAL_PROXY_PASSWORD=0259b3d8
+RESIDENTIAL_PROXY_REGION=GB_England
+RESIDENTIAL_PROXY_SESSION_DURATION=1m
+RESIDENTIAL_PROXY_SESSION_MODE=attempt
+```
+
+程序会自动拼接密码为 `0259b3d8-GB_England-{session}-1m`，每次 `pick` 轮换 session 获得新 IP。`worker` 模式可让同一线程固定 IP；`fixed` 模式可填 `RESIDENTIAL_PROXY_SESSION` 保持粘性。
+
+Clash/Surge 用户仍需在客户端配置 `dialer-proxy` 中转；本工具直连 Kookeey 网关，无需 Clash 脚本。
+
 ## 许可证
 
 本项目使用 [MIT License](./LICENSE)。

@@ -3,18 +3,41 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import requests
 
+from .utils import log
 from modules.terminal_theme import install_print_theme
 
 
 install_print_theme()
 
 
+def _read_dotenv() -> dict[str, str]:
+    path = Path(__file__).resolve().parents[1] / ".env"
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
 DEFAULT_PHONE_COUNTRIES = [
-    {"isoCode": "GB", "dialCode": "44", "name": "英国", "aliases": ["United Kingdom", "UK", "Britain", "Great Britain", "England"]},
+    {
+        "isoCode": "GB",
+        "dialCode": "44",
+        "name": "英国",
+        "heroSmsCountry": 16,
+        "aliases": ["United Kingdom", "UK", "Britain", "Great Britain", "England", "英格兰"],
+    },
     {"isoCode": "US", "dialCode": "1", "name": "美国", "aliases": ["United States", "USA", "America"]},
     {"isoCode": "CA", "dialCode": "1", "name": "加拿大", "aliases": ["Canada"]},
     {"isoCode": "AU", "dialCode": "61", "name": "澳大利亚", "aliases": ["Australia"]},
@@ -51,7 +74,7 @@ DEFAULT_PHONE_COUNTRIES = [
     {"isoCode": "IN", "dialCode": "91", "name": "印度", "aliases": ["India"]},
     {"isoCode": "JP", "dialCode": "81", "name": "日本", "aliases": ["Japan"]},
     {"isoCode": "KR", "dialCode": "82", "name": "韩国", "aliases": ["South Korea", "Korea Republic"]},
-    {"isoCode": "HK", "dialCode": "852", "name": "中国香港", "aliases": ["Hong Kong"]},
+    {"isoCode": "HK", "dialCode": "852", "name": "中国香港", "heroSmsCountry": 14, "aliases": ["Hong Kong"]},
     {"isoCode": "TW", "dialCode": "886", "name": "中国台湾", "aliases": ["Taiwan"]},
     {"isoCode": "BR", "dialCode": "55", "name": "巴西", "aliases": ["Brazil"]},
     {"isoCode": "MX", "dialCode": "52", "name": "墨西哥", "aliases": ["Mexico"]},
@@ -85,11 +108,171 @@ class OperatorQuote:
     note: str = ""
 
 
+# 自动选价：0=最低价，1=倒数第二低价（避免最低价无号/质量差）
+SMS_AUTO_PRICE_RANK = 1
+
+
+def _price_sort_key(price: float | None, count: int | None = None) -> tuple[float, int]:
+    return (price if price is not None else float("inf"), -(count or 0))
+
+
+def pick_country_by_price_rank(
+    countries: list[PhoneCountry],
+    rank: int = SMS_AUTO_PRICE_RANK,
+) -> PhoneCountry:
+    if not countries:
+        raise ValueError("no countries to pick")
+    ordered = sorted(countries, key=lambda row: _price_sort_key(row.price, row.count))
+    index = min(max(0, rank), len(ordered) - 1)
+    return ordered[index]
+
+
+def pick_operator_quote_by_price_rank(
+    quotes: list[OperatorQuote],
+    rank: int = SMS_AUTO_PRICE_RANK,
+    *,
+    max_price: float | None = None,
+) -> OperatorQuote | None:
+    eligible = [
+        row
+        for row in quotes
+        if row.price is not None
+        and (max_price is None or row.price <= max_price)
+        and (row.count is None or row.count > 0)
+    ]
+    if not eligible:
+        return None
+    ordered = sorted(eligible, key=lambda row: _price_sort_key(row.price, row.count))
+    index = min(max(0, rank), len(ordered) - 1)
+    return ordered[index]
+
+
+def resolve_hero_sms_operator_for_purchase(
+    provider: "HeroSMSProvider",
+    service: str,
+    country_id: int,
+    max_price: float,
+    prefix: str,
+    *,
+    price_rank: int = SMS_AUTO_PRICE_RANK,
+) -> str:
+    """未指定运营商时，按价格档位自动选择（默认倒数第二低价）。"""
+    quotes = provider.get_operator_quote_options(service, country_id)
+    picked = pick_operator_quote_by_price_rank(quotes, rank=price_rank, max_price=max_price)
+    if picked is None:
+        log(f"{prefix} [SMS] 无满足上限的运营商报价，使用 any（由平台分配）")
+        return ""
+    rank_label = "最低" if price_rank == 0 else f"第{price_rank + 1}低"
+    log(
+        f"{prefix} [SMS] 自动选择运营商({rank_label}价): {picked.label} "
+        f"${picked.price} 库存={picked.count if picked.count is not None else '-'}"
+    )
+    return picked.operator
+
+
 @dataclass(frozen=True)
 class SmsActivation:
     activation_id: int
     phone_number: str
     activation_cost: float | None = None
+
+
+@dataclass(frozen=True)
+class SmsCodeStatus:
+    received: bool
+    code: str
+    received_at: datetime | None = None
+
+
+def parse_sms_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12:
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        ts = int(text)
+        if ts > 1e12:
+            ts //= 1000
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def extract_sms_received_at(data: Any) -> datetime | None:
+    if not isinstance(data, dict):
+        return None
+    sms = data.get("sms")
+    if isinstance(sms, list) and sms:
+        for item in reversed(sms):
+            if not isinstance(item, dict):
+                continue
+            for key in ("receivedAt", "received_at", "date", "createdAt", "created_at", "time"):
+                parsed = parse_sms_timestamp(item.get(key))
+                if parsed:
+                    return parsed
+    if isinstance(sms, dict):
+        for key in ("receivedAt", "received_at", "date", "createdAt", "created_at", "time"):
+            parsed = parse_sms_timestamp(sms.get(key))
+            if parsed:
+                return parsed
+    for key in ("receivedAt", "received_at", "date", "createdAt", "created_at", "time"):
+        parsed = parse_sms_timestamp(data.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def _normalize_status_code(raw: str) -> str:
+    code = str(raw or "").strip()
+    if not code:
+        return ""
+    if re.fullmatch(r"\d{4,8}", code):
+        return code
+    from .utils import extract_code
+
+    parsed = extract_code(code)
+    if parsed:
+        return parsed
+    digits = re.sub(r"\D+", "", code)
+    if 4 <= len(digits) <= 8:
+        return digits
+    return ""
+
+
+def _parse_status_payload(data: Any) -> SmsCodeStatus:
+    if isinstance(data, str):
+        if data == "STATUS_WAIT_CODE":
+            return SmsCodeStatus(False, "")
+        if data == "STATUS_CANCEL":
+            raise RuntimeError("激活已被取消")
+        if data.startswith("STATUS_OK:"):
+            code = _normalize_status_code(data.split(":", 1)[1].strip())
+            return SmsCodeStatus(bool(code), code, None)
+        return SmsCodeStatus(False, "")
+    received_at = extract_sms_received_at(data if isinstance(data, dict) else {})
+    code = str(((data or {}).get("sms") or {}).get("code") or "").strip()
+    code = _normalize_status_code(code)
+    if not code and isinstance(data, dict):
+        sms = data.get("sms") or {}
+        if isinstance(sms, dict):
+            text = str(sms.get("text") or sms.get("message") or "").strip()
+            code = _normalize_status_code(text)
+    return SmsCodeStatus(bool(code), code, received_at)
 
 
 def parse_number(value: Any) -> float | None:
@@ -124,12 +307,44 @@ class HeroSMSProvider:
         self.api_key = api_key
         self.base_url = base_url
         self.timeout = timeout
+        self.proxies = self._configured_proxies()
+
+    @staticmethod
+    def _configured_proxies() -> dict[str, str] | None:
+        env = _read_dotenv()
+        enabled = str(env.get("HERO_SMS_USE_PROXY") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return None
+        proxy = (
+            env.get("HERO_SMS_PROXY")
+            or env.get("HTTPS_PROXY")
+            or env.get("HTTP_PROXY")
+            or ""
+        ).strip()
+        if not proxy:
+            proxy_file = Path(env.get("HERO_SMS_PROXY_FILE") or env.get("PROXY_FILE") or "data/proxies/proxies.txt")
+            if not proxy_file.is_absolute():
+                proxy_file = Path(__file__).resolve().parents[1] / proxy_file
+            if proxy_file.exists():
+                for raw in proxy_file.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                    line = raw.strip()
+                    if line and not line.startswith("#"):
+                        proxy = line
+                        break
+        if not proxy:
+            return None
+        if "://" not in proxy:
+            proxy = f"http://{proxy}"
+        return {"http": proxy, "https": proxy}
 
     def request(self, action: str, **params: Any) -> Any:
-        response = requests.get(
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(
             self.base_url,
             params={"api_key": self.api_key, "action": action, **params},
             timeout=self.timeout,
+            proxies=self.proxies,
         )
         response.raise_for_status()
         try:
@@ -229,6 +444,9 @@ class HeroSMSProvider:
             priced.append(replace(country, price=parsed.get("price"), count=parsed.get("count")))
         return sorted(priced, key=lambda row: ((row.price if row.price is not None else 999999), -(row.count or 0)))
 
+    def quote_service_country(self, service: str, country_id: int) -> dict[str, Any] | None:
+        return extract_country_price(self.get_price_matrix(service), country_id, service)
+
     def get_operators(self, country: int) -> list[str]:
         data = self.request("getOperators", country=country)
         raw = []
@@ -254,9 +472,17 @@ class HeroSMSProvider:
                 )
             except Exception as exc:
                 result.append(OperatorQuote(operator=operator, label=operator, price=None, count=None, note=str(exc)[:80]))
-        return result
+        return sorted(result, key=lambda row: _price_sort_key(row.price, row.count))
 
-    def get_number(self, service: str = "dr", country: int = 16, *, operator: str = "", max_retries: int = 5) -> SmsActivation:
+    def get_number(
+        self,
+        service: str = "dr",
+        country: int = 16,
+        *,
+        operator: str = "",
+        max_retries: int = 5,
+        max_price: float | None = None,
+    ) -> SmsActivation:
         # 英国 dr 经常无库存，允许自动尝试 tg 兜底。
         service_candidates: list[str] = [service]
         if service.strip().lower() == "dr":
@@ -270,8 +496,14 @@ class HeroSMSProvider:
                     params: dict[str, Any] = {"service": service_name, "country": country}
                     if operator:
                         params["operator"] = operator
+                    if max_price is not None:
+                        params["maxPrice"] = max_price
                     operator_text = f", operator={operator}" if operator else ", operator=任何运营商"
-                    print(f"[SMS] 请求 HeroSMS 号码: service={service_name}, country={country}{operator_text} ({attempt}/{max_retries})", flush=True)
+                    max_price_text = f", maxPrice={max_price}" if max_price is not None else ""
+                    print(
+                        f"[SMS] 请求 HeroSMS 号码: service={service_name}, country={country}{operator_text}{max_price_text} ({attempt}/{max_retries})",
+                        flush=True,
+                    )
                     data = self.request("getNumberV2", **params)
                 except Exception as exc:
                     business_error = self._extract_http_business_error(exc)
@@ -307,6 +539,18 @@ class HeroSMSProvider:
                 activation = self._normalize_get_number_payload(data)
                 if not activation:
                     raise RuntimeError(f"获取号码失败: {data}")
+                if (
+                    max_price is not None
+                    and activation.activation_cost is not None
+                    and activation.activation_cost > max_price
+                ):
+                    try:
+                        self.cancel(activation.activation_id)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"取号费用 ${activation.activation_cost} 超过上限 ${max_price}，已取消"
+                    )
                 print(
                     f"[SMS] 获取号码成功: {activation.phone_number} (activation={activation.activation_id}, 费用=${activation.activation_cost if activation.activation_cost is not None else '-'})",
                     flush=True,
@@ -318,9 +562,23 @@ class HeroSMSProvider:
                 params = {"service": service_name, "country": country}
                 if operator:
                     params["operator"] = operator
+                if max_price is not None:
+                    params["maxPrice"] = max_price
                 legacy = self.request("getNumber", **params)
                 activation = self._normalize_get_number_payload(legacy)
                 if activation:
+                    if (
+                        max_price is not None
+                        and activation.activation_cost is not None
+                        and activation.activation_cost > max_price
+                    ):
+                        try:
+                            self.cancel(activation.activation_id)
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            f"取号费用 ${activation.activation_cost} 超过上限 ${max_price}，已取消"
+                        )
                     print(f"[SMS] 通过 legacy getNumber 取号成功: {activation.phone_number} (activation={activation.activation_id})", flush=True)
                     return activation
                 if isinstance(legacy, str) and legacy == "NO_BALANCE":
@@ -339,18 +597,13 @@ class HeroSMSProvider:
         self.request("setStatus", id=activation_id, status=1)
         print("[SMS] 已标记为准备接收短信", flush=True)
 
-    def get_status(self, activation_id: int) -> tuple[bool, str]:
+    def get_status_detail(self, activation_id: int) -> SmsCodeStatus:
         data = self.request("getStatusV2", id=activation_id)
-        if isinstance(data, str):
-            if data == "STATUS_WAIT_CODE":
-                return False, ""
-            if data == "STATUS_CANCEL":
-                raise RuntimeError("激活已被取消")
-            if data.startswith("STATUS_OK:"):
-                return True, data.split(":", 1)[1].strip()
-            return False, ""
-        code = str(((data or {}).get("sms") or {}).get("code") or "").strip()
-        return (bool(code), code)
+        return _parse_status_payload(data)
+
+    def get_status(self, activation_id: int) -> tuple[bool, str]:
+        status = self.get_status_detail(activation_id)
+        return status.received, status.code
 
     def poll_for_code(self, activation_id: int, *, interval: float = 5.0, max_attempts: int = 60) -> str:
         for attempt in range(1, max_attempts + 1):

@@ -16,11 +16,11 @@ from modules.terminal_theme import GRAY, paint, style_timed_log
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 OUTPUT_FILES = {
-    "flow1_success": "output/gopay娉ㄥ唽plus/娴佺▼1_娉ㄥ唽鎴愬姛闀块摼鎺?txt",
-    "flow1_failed": "output/gopay娉ㄥ唽plus/娴佺▼1_娉ㄥ唽澶辫触璐﹀彿.txt",
-    "flow1_in_progress": "output/gopay娉ㄥ唽plus/娴佺▼1_娉ㄥ唽澶勭悊涓?txt",
-    "flow2_paid_success": "output/gopay娉ㄥ唽plus/娴佺▼2_鏀粯鎴愬姛寰呮巿鏉?txt",
-    "flow2_nonzero_billing": "output/gopay娉ㄥ唽plus/娴佺▼2_闈?鍏冭处鍗曡烦杩?txt",
+    "flow1_success": "output/gopay_plus/flow1_success_links.txt",
+    "flow1_failed": "output/gopay_plus/flow1_failed_accounts.txt",
+    "flow1_in_progress": "output/gopay_plus/flow1_in_progress.txt",
+    "flow2_paid_success": "output/gopay_plus/flow2_paid_success_pending_auth.txt",
+    "flow2_nonzero_billing": "output/gopay_plus/flow2_nonzero_billing.txt",
 }
 
 LEGACY_OUTPUT_FILES = {

@@ -25,6 +25,7 @@ from modules.hero_sms_provider import (
     DEFAULT_PHONE_COUNTRIES,
     OperatorQuote,
     PhoneCountry,
+    SMS_AUTO_PRICE_RANK,
     SmsActivation,
     parse_integer,
     parse_number,
@@ -224,8 +225,7 @@ class FiveSimProvider:
             operators = product_map.get(slug)
             if not isinstance(operators, dict) or not operators:
                 continue
-            # 取价格最低的 operator（通常是 "any"）
-            best_cost: float | None = None
+            costs: list[float] = []
             total_count = 0
             for op_name, op_meta in operators.items():
                 if not isinstance(op_meta, dict):
@@ -234,8 +234,14 @@ class FiveSimProvider:
                 count = parse_integer(op_meta.get("count"))
                 if count:
                     total_count += count
-                if cost is not None and (best_cost is None or cost < best_cost):
-                    best_cost = cost
+                if cost is not None:
+                    costs.append(cost)
+            costs.sort()
+            best_cost = (
+                costs[SMS_AUTO_PRICE_RANK]
+                if len(costs) > SMS_AUTO_PRICE_RANK
+                else (costs[0] if costs else None)
+            )
             if best_cost is None:
                 continue
             priced.append(replace(country, price=best_cost, count=total_count or None))
@@ -336,29 +342,36 @@ class FiveSimProvider:
         """5sim 购买成功后自动进入 RECEIVED 状态，无需显式通知。保留方法以兼容接口。"""
         print(f"[SMS] 5sim order {activation_id} 已自动待收码，无需 mark_ready", flush=True)
 
-    def get_status(self, activation_id: int) -> tuple[bool, str]:
-        """Check the order, return (received, code)."""
+    def get_status_detail(self, activation_id: int):
+        from .hero_sms_provider import SmsCodeStatus, parse_sms_timestamp
+
         data = self._request("GET", f"/user/check/{activation_id}")
         if isinstance(data, str):
-            # 5sim 偶尔返回 plain text "order not found" 等
-            return False, ""
+            return SmsCodeStatus(False, "", None)
         if not isinstance(data, dict):
-            return False, ""
+            return SmsCodeStatus(False, "", None)
         status = str(data.get("status") or "").upper()
         sms = data.get("sms") or []
         if isinstance(sms, list) and sms:
-            # 取最新一条带 code 的 SMS
             for entry in reversed(sms):
                 if not isinstance(entry, dict):
                     continue
                 code = str(entry.get("code") or "").strip()
-                if code:
-                    return True, code
+                if not code:
+                    continue
+                received_at = None
+                for key in ("date", "created_at", "createdAt", "time"):
+                    received_at = parse_sms_timestamp(entry.get(key))
+                    if received_at:
+                        break
+                return SmsCodeStatus(True, code, received_at)
         if status in {"CANCELED", "BANNED"}:
             raise RuntimeError(f"5sim order {activation_id} 状态={status}")
-        if status == "TIMEOUT":
-            return False, ""
-        return False, ""
+        return SmsCodeStatus(False, "", None)
+
+    def get_status(self, activation_id: int) -> tuple[bool, str]:
+        status = self.get_status_detail(activation_id)
+        return status.received, status.code
 
     def poll_for_code(self, activation_id: int, *, interval: float = 5.0, max_attempts: int = 60) -> str:
         for attempt in range(1, max_attempts + 1):

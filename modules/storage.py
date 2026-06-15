@@ -71,10 +71,18 @@ def _generate_external_imap163_account() -> MailAccount | None:
 
 def parse_mail_line(line: str) -> MailAccount | None:
     line = line.strip()
-    email_match = re.search(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", line)
-    if not email_match:
+    if not line:
         return None
-    email = email_match.group(0)
+    parts = [part.strip() for part in line.split("----")]
+    # Hotmail/Outlook 池格式为 email----password----client_id----refresh_token；
+    # 勿用宽松正则扫整行，否则会把 refresh_token 里的 ".U.MsaArtifacts" 误当成邮箱后缀。
+    if parts and "@" in parts[0]:
+        email = parts[0]
+    else:
+        email_match = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", line)
+        if not email_match:
+            return None
+        email = email_match.group(0)
     url_match = re.search(r"https?://\S+", line)
     mail_url = url_match.group(0).rstrip("，,。;；") if url_match else None
     parts = [part.strip() for part in line.split("----")]

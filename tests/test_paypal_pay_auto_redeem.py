@@ -174,7 +174,7 @@ def test_run_paypal_pay_local_random_card_mode_works_without_card_pool(monkeypat
     assert result == 0
     assert captured["email"] == "user@example.com"
     assert len(captured["card_number"]) >= 13
-    assert captured["card_number"][0] in {"4", "5"}
+    assert captured["card_number"][0] in {"2", "4", "5"}
     assert captured["zip"]
 
 

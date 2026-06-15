@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -7,9 +7,11 @@ import sys
 import authorization_flow
 import fill_billing_test
 from modules import free_register
+from modules import cursor_register
+from modules import cursor_protocol_register
 from modules import session_export
-from modules.paypal_flow import interactive_paypal
 from modules.env_settings import settings_panel
+from modules.hero_sms_provider import configured_country_catalog, match_country
 from modules.terminal_theme import install_print_theme
 from modules.terminal_theme import BLUE, CYAN, GREEN, MAGENTA, YELLOW, paint
 from modules.browser import BrowserSession
@@ -129,12 +131,27 @@ class SuccessCounter:
 
 def apply_env_config(cfg: dict, env_path: str = ".env", flow_key: str = "") -> dict:
     env = load_env(env_path)
-    flow_source = env.get(f"{flow_key.upper()}_MAIL_SOURCE") if flow_key else ""
+    flow_defaults = {"CURSOR": "hotmail"}
+    flow_source = ""
+    if flow_key:
+        flow_source = (
+            env.get(f"{flow_key.upper()}_MAIL_SOURCE")
+            or flow_defaults.get(flow_key.upper())
+            or ""
+        ).strip().lower()
     mail_source = (flow_source or env.get("MAIL_SOURCE") or cfg.get("mail", {}).get("active_source") or "").strip().lower()
     if mail_source:
         configure_mail_source(cfg, mail_source)
     use_proxy = env_bool(env.get("USE_PROXY"), default=bool(cfg.get("browser", {}).get("use_proxy", False)))
     cfg.setdefault("browser", {})["use_proxy"] = use_proxy
+    cfg["browser"]["incognito"] = env_bool(
+        env.get("BROWSER_INCOGNITO"),
+        default=bool(cfg.get("browser", {}).get("incognito", False)),
+    )
+    cfg["browser"]["headless"] = env_bool(
+        env.get("BROWSER_HEADLESS"),
+        default=bool(cfg.get("browser", {}).get("headless", False)),
+    )
     cfg["browser"]["proxy_file"] = env.get("PROXY_FILE") or cfg["browser"].get("proxy_file", "data/proxies/proxies.txt")
     cfg.setdefault("mail", {})["account_mode"] = env.get("MAIL_ACCOUNT_MODE") or cfg.get("mail", {}).get("account_mode", "pool")
     cfg["mail"]["moemail_base_url"] = env.get("MOEMAIL_BASE_URL") or cfg["mail"].get("moemail_base_url", "")
@@ -298,6 +315,8 @@ def make_sms_args(args: argparse.Namespace | None = None) -> argparse.Namespace:
 
 
 def resolve_flow_sms_selection(args: argparse.Namespace | None = None, *, flow_label: str, flow_key: str) -> dict[str, object] | None:
+    if authorization_flow is None:
+        return None
     return authorization_flow.resolve_authorization_sms_selection(make_sms_args(args), flow_label=flow_label, flow_key=flow_key)
 
 
@@ -307,6 +326,79 @@ def resolve_flow1_sms_selection(args: argparse.Namespace | None = None) -> dict[
 
 def resolve_free_sms_selection(args: argparse.Namespace | None = None) -> dict[str, object] | None:
     return resolve_flow_sms_selection(args, flow_label="Free 注册", flow_key="FREE")
+
+
+CURSOR_FIXED_SMS_SERVICE = "ot"  # HeroSMS: Any other
+CURSOR_FIXED_SMS_COUNTRY = "England"
+
+
+def resolve_cursor_sms_selection(args: argparse.Namespace | None = None) -> dict[str, object] | None:
+    """Cursor 接码固定：服务 Any other (ot)，地区英格兰/英国 (GB)。"""
+    _ = args
+    env = load_env(".env")
+    sms_enabled = (env.get("CURSOR_SMS_ENABLED") or env.get("SMS_ENABLED") or "true").strip()
+    if not env_bool(sms_enabled, default=True):
+        print("[SMS] Cursor 接码已关闭，请开启 CURSOR_SMS_ENABLED。")
+        return None
+    api_key = (
+        env.get("HERO_SMS_API_KEY")
+        or env.get("HEROSMS_API_KEY")
+        or env.get("SMS_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        print("[SMS] 未配置 HERO_SMS_API_KEY，Cursor 注册无法继续。")
+        return None
+
+    from modules.hero_sms_provider import HeroSMSProvider, PhoneCountry
+
+    country_key = (
+        env.get("CURSOR_SMS_COUNTRY")
+        or env.get("CURSOR_SMS_COUNTRY_SELECT")
+        or CURSOR_FIXED_SMS_COUNTRY
+    ).strip()
+    catalog = configured_country_catalog()
+    country = match_country(country_key, catalog)
+    if not country:
+        country = PhoneCountry(
+            "GB",
+            "44",
+            "英国",
+            16,
+            ("United Kingdom", "UK", "England", "英格兰"),
+        )
+
+    max_price = float(env.get("CURSOR_SMS_MAX_PRICE") or cursor_register.CURSOR_SMS_MAX_PRICE_DEFAULT)
+    provider = HeroSMSProvider(api_key)
+    quoted = provider.quote_service_country(CURSOR_FIXED_SMS_SERVICE, country.hero_sms_country)
+    quote_price = quoted.get("price") if quoted else None
+    quote_stock = quoted.get("count") if quoted else None
+    if quote_price is not None and quote_price > max_price:
+        print(
+            f"[SMS] Cursor 接码报价 ${quote_price} 超过上限 ${max_price}（库存={quote_stock}），已停止。"
+        )
+        return None
+
+    price_text = f"${quote_price}" if quote_price is not None else "未知"
+    print(
+        f"[SMS] Cursor 固定接码: service=Any other ({CURSOR_FIXED_SMS_SERVICE}), "
+        f"country={country.name} (+{country.dial_code}), HeroSMS ID={country.hero_sms_country}, "
+        f"报价={price_text}, 上限=${max_price}"
+    )
+    return {
+        "provider": "herosms",
+        "provider_label": "HeroSMS",
+        "api_key": api_key,
+        "service": CURSOR_FIXED_SMS_SERVICE,
+        "country": country,
+        "operator": None,
+        "max_price": max_price,
+        "poll_interval": float(env.get("HERO_SMS_POLL_INTERVAL") or 5),
+        "max_attempts": int(env.get("HERO_SMS_MAX_ATTEMPTS") or 60),
+        "cursor_sms_resend_wait_sec": float(
+            env.get("CURSOR_SMS_CODE_RESEND_WAIT_SEC") or cursor_register.CURSOR_SMS_CODE_RESEND_WAIT_SEC
+        ),
+    }
 
 
 async def run_account(
@@ -342,6 +434,7 @@ async def run_account(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        incognito=bool(browser_cfg.get("incognito", False)),
         fingerprint_seed=account.email,
     )
     try:
@@ -565,45 +658,6 @@ def make_gopay_args(config_path: str) -> argparse.Namespace:
     )
 
 
-def interactive_gopay_plus(config_path: str, cfg: dict) -> int:
-    while True:
-        ui_header("GoPay 注册 Plus", "选择子功能")
-        sub_items = [
-            ("1", "注册并生成链接", "流程一"),
-            ("2", "GoPay 支付长链接", "流程二"),
-            ("3", "OAuth 授权", "流程三"),
-            ("4", "Session 导出", "流程四"),
-            ("5", "返回上级菜单", ""),
-        ]
-        for key, name, hint in sub_items:
-            ui_option(key, name, hint, dim=(key == "5"))
-        ui_footer()
-        choice = ui_prompt("请输入选项 [1-5]:")
-        if choice == "1":
-            result = interactive_main(config_path)
-            if should_return_to_menu():
-                continue
-            return result
-        if choice == "2":
-            result = fill_billing_test.interactive_batch(make_gopay_args(config_path))
-            if should_return_to_menu():
-                continue
-            return result
-        if choice == "3":
-            result = authorization_flow.interactive_authorize()
-            if should_return_to_menu():
-                continue
-            return result
-        if choice == "4":
-            result = session_export.interactive_session_export()
-            if should_return_to_menu():
-                continue
-            return result
-        if choice in {"0", "5"}:
-            return -1  # sentinel to indicate "back to main menu"
-        ui_error("请输入 1 到 5 之间的数字")
-
-
 def interactive_menu(config_path: str) -> int:
     cfg = apply_env_config(load_config(config_path))
     if len((cfg.get("mail_sources") or {})) > 1:
@@ -611,45 +665,34 @@ def interactive_menu(config_path: str) -> int:
         choose_mail_source(cfg, chosen_source)
     while True:
         print_home_menu(cfg)
-        choice = ui_prompt("请输入选项 [1-5]:")
+        choice = ui_prompt("请输入选项 [1-3]:")
         if choice == "1":
-            sms_selection = resolve_free_sms_selection()
-            result = free_register.interactive_free_register(config_path, cfg, sms_selection, ask_positive_int)
+            cfg = apply_env_config(load_config(config_path), flow_key="CURSOR")
+            sms_selection = resolve_cursor_sms_selection()
+            result = cursor_protocol_register.interactive_cursor_protocol_register(
+                config_path, cfg, sms_selection, ask_positive_int
+            )
             if should_return_to_menu():
                 continue
             return result
         if choice == "2":
-            result = interactive_gopay_plus(config_path, cfg)
-            if result == -1:
-                continue
-            if should_return_to_menu():
-                continue
-            return result
-        if choice == "3":
-            result = interactive_paypal(config_path, cfg)
-            if should_return_to_menu():
-                continue
-            return result
-        if choice == "4":
             settings_panel(".env")
             cfg = apply_env_config(load_config(config_path))
             continue
-        if choice in {"0", "5"}:
+        if choice in {"0", "3"}:
             return 0
-        ui_error("请输入 1 到 5 之间的数字")
+        ui_error("请输入 1 到 3 之间的数字")
 
 
 def print_home_menu(cfg: dict) -> None:
-    ui_header("ChatGPT Assistant", "选择功能")
+    ui_header("Cursor 自动注册工具", "选择功能")
     menu_items = [
-        ("1", "Free 注册", "注册 + 授权 + 导出"),
-        ("2", "GoPay 注册 Plus", "注册 + 支付 + 授权 + 导出"),
-        ("3", "PayPal Plus", "注册 + 支付 + 授权"),
-        ("4", "设置", "邮箱源 / 接码 / 设备绑定"),
-        ("5", "退出", ""),
+        ("1", "Cursor 协议注册", "HTTP Next-Action + 邮箱/手机接码"),
+        ("2", "设置", "邮箱源 / 接码 / 设备绑定"),
+        ("3", "退出", ""),
     ]
     for key, name, hint in menu_items:
-        ui_option(key, name, hint, dim=(key in {"4", "5"}))
+        ui_option(key, name, hint, dim=(key in {"2", "3"}))
     ui_footer()
     print(paint("  作者：hanyiz2", BLUE, bold=True))
 
@@ -706,11 +749,19 @@ async def run_many_with_config(cfg: dict, workers: int, count: int, sms_selectio
 
 def main() -> int:
     migrate_known_output_files()
-    parser = argparse.ArgumentParser(description="ChatGPT 注册 / GoPay / 授权 / Session 导出 / Free 注册工具")
+    parser = argparse.ArgumentParser(description="Cursor 自动注册 / ChatGPT 注册 / GoPay / 授权 / Session 导出工具")
     parser.add_argument(
         "--mode",
-        choices=["register", "gopay", "authorize", "session-export", "free-register"],
-        help="功能模式: register / gopay / authorize / session-export / free-register",
+        choices=[
+            "register",
+            "gopay",
+            "authorize",
+            "session-export",
+            "free-register",
+            "cursor-register",
+            "cursor-register-protocol",
+        ],
+        help="功能模式: … / cursor-register / cursor-register-protocol（均为 HTTP 协议注册）",
     )
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--workers", type=int, help="并发浏览器 worker 数")
@@ -718,11 +769,19 @@ def main() -> int:
     parser.add_argument("--country", default="", help="流程二/三接码国家: 序号 / ISO / 平台国家 ID，例如 US")
     parser.add_argument("--sms-provider", default="", help="流程二/三接码平台: herosms / grizzly")
     parser.add_argument("--mail-source", choices=["moemail", "hotmail", "hotmail_graph"], help="邮箱来源: moemail 或 hotmail")
-    parser.add_argument("--register-mode", choices=["phone", "email"], default="phone", help="Free 注册模式: phone(默认) / email")
+    parser.add_argument(
+        "--register-mode",
+        choices=["phone", "email", "email-only"],
+        default="phone",
+        help="Free 注册模式: phone(默认) / email(含OAuth) / email-only(仅注册保存)",
+    )
     args = parser.parse_args()
     if args.mode == "gopay":
         return fill_billing_test.interactive_batch(make_gopay_args(args.config))
     if args.mode == "authorize":
+        if authorization_flow is None:
+            log("授权模块加载失败，暂时无法运行 authorize 模式。")
+            return 1
         return authorization_flow.interactive_authorize(
             argparse.Namespace(
                 count=args.count,
@@ -742,6 +801,22 @@ def main() -> int:
         )
     if args.mode == "session-export":
         return session_export.interactive_session_export()
+    if args.mode in {"cursor-register", "cursor-register-protocol"}:
+        cfg = apply_env_config(load_config(args.config), flow_key="CURSOR")
+        sms_selection = resolve_cursor_sms_selection(args)
+        if not sms_selection or not str((sms_selection or {}).get("api_key") or "").strip():
+            log("[SMS] 缺少 HERO_SMS_API_KEY，已停止 Cursor 注册")
+            return 1
+        runner = cursor_protocol_register.run_cursor_protocol_register_many
+        log("[Protocol] 浏览器过 Cloudflare 后优先 httpx/Next-Action，失败步骤仍走 DOM")
+        return asyncio.run(
+            runner(
+                cfg,
+                count=args.count or 1,
+                workers=args.workers or 1,
+                sms_selection=sms_selection,
+            )
+        )
     if args.mode == "free-register":
         cfg = apply_env_config(load_config(args.config), flow_key="FREE")
         sms_selection = resolve_free_sms_selection(args)

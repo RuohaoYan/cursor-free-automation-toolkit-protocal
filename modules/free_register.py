@@ -18,7 +18,7 @@ from .free_browser_flow import FreeBrowserFlow
 from .mail_provider import MailProvider
 from .moemail_factory import create_moemail_accounts, split_domains
 from .proxy_pool import ProxyPool
-from .storage import MailAccount, parse_mail_line
+from .storage import AccountStore, MailAccount, parse_mail_line
 from .utils import load_env, log, now_utc, resolve_path, safe_filename
 
 
@@ -28,6 +28,7 @@ FREE_CPA_DIR = "cpa号池"
 
 # 保护 account.txt 读改写，防止并发 worker 互相覆盖
 _ACCOUNT_WRITE_LOCK = asyncio.Lock()
+_FREE_POOL_LOCK = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -47,12 +48,166 @@ class FreeProfile:
 
 @dataclass(frozen=True)
 class FreeMailSource:
-    source: str
+    source_key: str
     account: MailAccount
+    mail_cfg: dict[str, Any]
+    store: AccountStore | None = None
+
+    @property
+    def source(self) -> str:
+        return self.source_key
 
 
 class FreeRegisterError(RuntimeError):
     pass
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text not in {"0", "false", "no", "off", "关闭", "否"}
+
+
+def _flow_output_root(flow: str) -> Path:
+    if flow.upper() == "CURSOR":
+        return resolve_path("output/cursor注册")
+    return free_output_paths().root
+
+
+def resolve_free_mail_config(cfg: dict[str, Any], source_key: str) -> dict[str, Any]:
+    base = dict(cfg.get("mail", {}) or {})
+    sources = cfg.get("mail_sources") or {}
+    source_cfg = dict(sources.get(source_key) or {})
+    merged = {**base, **source_cfg}
+    merged_source = str(
+        merged.get("source")
+        or source_cfg.get("source")
+        or base.get("source")
+        or source_key
+    ).strip()
+    merged["source"] = merged_source or source_key
+    return merged
+
+
+def _build_free_pool_store(source_key: str, mail_cfg: dict[str, Any], *, flow: str = "FREE") -> AccountStore:
+    accounts_file = str(mail_cfg.get("accounts_file") or "").strip()
+    raw_pool_file = str(mail_cfg.get("raw_pool_file") or "").strip()
+    if not accounts_file:
+        raise FreeRegisterError(f"{source_key} 邮箱池缺少 accounts_file")
+    if not raw_pool_file:
+        raise FreeRegisterError(f"{source_key} 邮箱池缺少 raw_pool_file")
+    output_root = _flow_output_root(flow)
+    suffix = source_key.replace("_", "-")
+    prefix = "cursor" if flow.upper() == "CURSOR" else "free"
+    return AccountStore(
+        accounts_file=accounts_file,
+        raw_pool_file=raw_pool_file,
+        success_file=str(output_root / f"{prefix}_pool_{suffix}_success.txt"),
+        failed_file=str(output_root / f"{prefix}_pool_{suffix}_failed.txt"),
+        in_progress_file=str(output_root / f"{prefix}_pool_{suffix}_in_progress.txt"),
+    )
+
+
+def reset_free_pool_claims_on_start(
+    cfg: dict[str, Any],
+    env: dict[str, str],
+    *,
+    prefix: str = "[Free]",
+    flow: str = "FREE",
+) -> int:
+    """Release stale email-pool claims left by interrupted runs."""
+    enabled = _truthy(
+        env.get("FREE_RESET_POOL_CLAIMS_ON_START")
+        or cfg.get("free_register", {}).get("reset_pool_claims_on_start"),
+        default=True,
+    )
+    if not enabled:
+        return 0
+
+    source_key = resolve_flow_mail_source(cfg, env, flow)
+    if source_key == "moemail":
+        return 0
+
+    mail_cfg = resolve_free_mail_config(cfg, source_key)
+    store = _build_free_pool_store(source_key, mail_cfg, flow=flow)
+    lines = [line for line in store.in_progress_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return 0
+
+    store.in_progress_file.write_text("", encoding="utf-8")
+    log(f"{prefix} 已清理上次中断遗留的邮箱池处理中记录 {len(lines)} 条: {store.in_progress_file}")
+    return len(lines)
+
+
+def _require_hotmail_tokens(account: MailAccount) -> MailAccount:
+    if account.mail_url:
+        return account
+    if account.client_id and account.refresh_token:
+        return account
+    raise FreeRegisterError("Hotmail/Outlook 账号池格式需要: email----password----client_id----refresh_token")
+
+
+async def _release_free_pool_claim(mail_source: FreeMailSource) -> None:
+    store = mail_source.store
+    if not store:
+        return
+    store.finish_claim(mail_source.account.email)
+
+
+async def _finalize_free_pool_account(
+    mail_source: FreeMailSource,
+    *,
+    success: bool,
+    prefix: str,
+    failure_reason: str = "",
+) -> None:
+    store = mail_source.store
+    if not store:
+        return
+    account = mail_source.account
+    if success:
+        store.complete(account.email)
+        store.finish_claim(account.email)
+        log(f"{prefix} 邮箱池账号已标记成功: {account.email}")
+        return
+    store.save_failed(account.email, failure_reason or "failed")
+    store.return_to_pool(account)
+    log(f"{prefix} 邮箱池账号已退回/标记失败: {account.email}")
+
+
+def normalize_register_mode(mode: str | None) -> str:
+    raw = str(mode or "").strip().lower()
+    aliases = {
+        "phone": "phone",
+        "mobile": "phone",
+        "email": "email",
+        "email-only": "email",
+        "email_only": "email",
+        "emailonly": "email",
+    }
+    normalized = aliases.get(raw)
+    if not normalized:
+        raise FreeRegisterError(f"invalid register_mode: {mode}")
+    return normalized
+
+
+def classify_free_register_error(exc: Exception) -> str:
+    text = str(exc)
+    low = text.lower()
+    if "invalid register_mode" in low:
+        return "invalid_mode"
+    if "邮箱池为空" in text or "无可领取账号" in text or "mail pool" in low or "pool empty" in low:
+        return "mail_pool_empty"
+    if "email already registered" in low:
+        return "email_already_registered"
+    if "超时" in text or "timeout" in low or "timed out" in low:
+        return "timeout"
+    if "oauth callback missing code" in low:
+        return "oauth_callback_missing_code"
+    return "unknown"
 
 
 def free_output_paths(root: str | Path = FREE_OUTPUT_ROOT) -> FreeOutputPaths:
@@ -71,7 +226,14 @@ def ensure_free_output_dirs(root: str | Path = FREE_OUTPUT_ROOT) -> FreeOutputPa
 
 def resolve_flow_mail_source(cfg: dict[str, Any], env: dict[str, str], flow: str) -> str:
     flow_key = f"{flow.upper()}_MAIL_SOURCE"
-    value = (env.get(flow_key) or env.get("MAIL_SOURCE") or "").strip().lower()
+    flow_specific = (env.get(flow_key) or "").strip().lower()
+    if flow_specific:
+        return normalize_mail_source(flow_specific)
+    flow_defaults = {"CURSOR": "hotmail"}
+    flow_default = flow_defaults.get(flow.upper())
+    if flow_default:
+        return normalize_mail_source(flow_default)
+    value = (env.get("MAIL_SOURCE") or "").strip().lower()
     if value:
         return normalize_mail_source(value)
     return normalize_mail_source(
@@ -250,32 +412,64 @@ def write_free_outputs(account: MailAccount, token_bundle: dict[str, Any], root:
     return {"account": paths.account_file, "token": token_path}
 
 
-async def create_free_mail_account(cfg: dict[str, Any], env: dict[str, str]) -> FreeMailSource:
-    source = resolve_flow_mail_source(cfg, env, "FREE")
-    if source != "moemail":
-        raise FreeRegisterError("Free 注册当前只支持 MoeMail 自动创建邮箱；后续可接入本地邮箱池")
-    base_url = (env.get("MOEMAIL_BASE_URL") or cfg.get("mail", {}).get("moemail_base_url") or "").strip()
-    api_key = (env.get("MOEMAIL_API_KEY") or cfg.get("mail", {}).get("moemail_api_key") or "").strip()
-    if not base_url or not api_key:
-        raise FreeRegisterError("Free 注册需要配置 MOEMAIL_BASE_URL / MOEMAIL_API_KEY")
-    domains = select_moemail_domains(cfg, env, "FREE")
-    created = await create_moemail_accounts(
-        base_url=base_url,
-        api_key=api_key,
-        count=1,
-        domains=domains,
-        prefix=env.get("FREE_MOEMAIL_CREATE_PREFIX") or env.get("MOEMAIL_CREATE_PREFIX") or cfg.get("mail", {}).get("moemail_create_prefix", "openai"),
-        mode=env.get("FREE_MOEMAIL_CREATE_MODE") or env.get("MOEMAIL_CREATE_MODE") or cfg.get("mail", {}).get("moemail_create_mode", "human"),
-        batch_name=f"free-{int(time.time())}",
-        expiry_time_ms=0,
-    )
-    if not created:
-        raise FreeRegisterError("MoeMail 未创建到可用邮箱")
-    item = created[0]
-    account = parse_mail_line(item.mail_line) or MailAccount(email=item.email, mail_url=extract_code_address(item.mail_line), raw=item.mail_line)
-    if not account.mail_url:
-        raise FreeRegisterError(f"MoeMail 导出行缺少接码地址: {item.email}")
-    return FreeMailSource(source=source, account=account)
+async def create_free_mail_account(
+    cfg: dict[str, Any],
+    env: dict[str, str],
+    *,
+    worker_id: int | str = 1,
+    flow: str = "FREE",
+) -> FreeMailSource:
+    source_key = resolve_flow_mail_source(cfg, env, flow)
+    mail_cfg = resolve_free_mail_config(cfg, source_key)
+    if source_key == "moemail":
+        base_url = (env.get("MOEMAIL_BASE_URL") or mail_cfg.get("moemail_base_url") or "").strip()
+        api_key = (env.get("MOEMAIL_API_KEY") or mail_cfg.get("moemail_api_key") or "").strip()
+        if not base_url or not api_key:
+            raise FreeRegisterError("需要配置 MOEMAIL_BASE_URL / MOEMAIL_API_KEY")
+        domains = select_moemail_domains(cfg, env, flow)
+        created = await create_moemail_accounts(
+            base_url=base_url,
+            api_key=api_key,
+            count=1,
+            domains=domains,
+            prefix=(
+                env.get(f"{flow.upper()}_MOEMAIL_CREATE_PREFIX")
+                or env.get("FREE_MOEMAIL_CREATE_PREFIX")
+                or env.get("MOEMAIL_CREATE_PREFIX")
+                or mail_cfg.get("moemail_create_prefix", "cursor")
+            ),
+            mode=env.get("FREE_MOEMAIL_CREATE_MODE") or env.get("MOEMAIL_CREATE_MODE") or mail_cfg.get("moemail_create_mode", "human"),
+            batch_name=f"{flow.lower()}-{int(time.time())}",
+            expiry_time_ms=0,
+        )
+        if not created:
+            raise FreeRegisterError("MoeMail 未创建到可用邮箱")
+        item = created[0]
+        account = parse_mail_line(item.mail_line) or MailAccount(
+            email=item.email,
+            mail_url=extract_code_address(item.mail_line),
+            raw=item.mail_line,
+        )
+        if not account.mail_url:
+            raise FreeRegisterError(f"MoeMail 导出行缺少接码地址: {item.email}")
+        return FreeMailSource(source_key=source_key, account=account, mail_cfg=mail_cfg)
+
+    store = _build_free_pool_store(source_key, mail_cfg, flow=flow)
+    async with _FREE_POOL_LOCK:
+        account = store.claim_next(worker_id)
+    if not account:
+        pending = store.pending_count()
+        if pending > 0:
+            raise FreeRegisterError(
+                f"邮箱池无可领取账号: {mail_cfg.get('accounts_file')} "
+                f"({pending} 行仍在池内，但都被 in_progress 标记为处理中)"
+            )
+        raise FreeRegisterError(f"邮箱池为空: {mail_cfg.get('accounts_file')}")
+    if source_key == "hotmail":
+        account = _require_hotmail_tokens(account)
+    if source_key == "icloud_query" and not account.mail_url:
+        raise FreeRegisterError("iCloud 查询邮箱格式需要: email----查询码")
+    return FreeMailSource(source_key=source_key, account=account, mail_cfg=mail_cfg, store=store)
 
 
 def extract_code_address(mail_line: str) -> str:
@@ -846,6 +1040,7 @@ async def phase2_email_oauth_token(
 
 
 async def run_free_register_many(cfg: dict[str, Any], *, count: int, workers: int, sms_selection: dict[str, object] | None, register_mode: str = "phone") -> int:
+    register_mode = normalize_register_mode(register_mode)
     proxy_pool = ProxyPool(cfg.get("browser", {}).get("proxy_file", "data/proxies/proxies.txt")) if cfg.get("browser", {}).get("use_proxy") else None
     success = 0
     attempts = 0
@@ -864,10 +1059,18 @@ async def run_free_register_many(cfg: dict[str, Any], *, count: int, workers: in
             # 每次尝试都轮换代理，避免同一 worker 被单个代理绑死
             proxy = proxy_pool.pick(attempt_no) if proxy_pool else None
             worker_sms_selection = {**sms_selection} if sms_selection else None
-            if register_mode == "email":
-                ok = await run_free_register_once_email(cfg, sms_selection=worker_sms_selection, worker_id=worker_id, proxy=proxy)
-            else:
-                ok = await run_free_register_once(cfg, sms_selection=worker_sms_selection, worker_id=worker_id, proxy=proxy)
+            try:
+                ok = await _run_register_once_by_mode(
+                    cfg,
+                    register_mode=register_mode,
+                    sms_selection=worker_sms_selection,
+                    worker_id=worker_id,
+                    proxy=proxy,
+                )
+            except Exception as exc:
+                err_code = classify_free_register_error(exc)
+                log(f"[free-{worker_id:02d}] Free 注册尝试启动失败[{err_code}]: {exc.__class__.__name__}: {exc}")
+                ok = False
             if ok:
                 async with lock:
                     success += 1
@@ -875,6 +1078,20 @@ async def run_free_register_many(cfg: dict[str, Any], *, count: int, workers: in
     await asyncio.gather(*(worker(worker_id) for worker_id in range(1, max(1, workers) + 1)))
     log(f"Free 注册结束，成功数: {success}/{count}，尝试数: {attempts}/{max_attempts}")
     return 0 if success >= count else 1
+
+
+async def _run_register_once_by_mode(
+    cfg: dict[str, Any],
+    *,
+    register_mode: str,
+    sms_selection: dict[str, object] | None,
+    worker_id: int,
+    proxy: str | None,
+) -> bool:
+    register_mode = normalize_register_mode(register_mode)
+    if register_mode == "email":
+        return await run_free_register_once_email(cfg, sms_selection=sms_selection, worker_id=worker_id, proxy=proxy)
+    return await run_free_register_once(cfg, sms_selection=sms_selection, worker_id=worker_id, proxy=proxy)
 
 
 def interactive_free_register(config_path: str, cfg: dict[str, Any], sms_selection: dict[str, object] | None, ask_positive_int) -> int:

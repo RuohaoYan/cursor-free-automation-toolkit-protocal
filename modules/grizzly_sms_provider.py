@@ -184,7 +184,9 @@ class GrizzlySMSProvider:
         except Exception as exc:
             print(f"[SMS] 标记准备接收失败，继续等待验证码: {exc}", flush=True)
 
-    def get_status(self, activation_id: int) -> tuple[bool, str]:
+    def get_status_detail(self, activation_id: int) -> "SmsCodeStatus":
+        from .hero_sms_provider import SmsCodeStatus, _parse_status_payload
+
         try:
             data = self.request("getStatusV2", id=activation_id)
             if parse_error_text(data) in {"BAD_ACTION", "NO_ACTION", "WRONG_ACTION", "ERROR_SQL"}:
@@ -192,15 +194,18 @@ class GrizzlySMSProvider:
         except Exception:
             data = self.request("getStatus", id=activation_id)
         if isinstance(data, str):
-            if data == "STATUS_WAIT_CODE":
-                return False, ""
-            if data == "STATUS_CANCEL":
-                raise RuntimeError("激活已被取消")
-            if data.startswith("STATUS_OK:"):
-                return True, data.split(":", 1)[1].strip()
-            return False, ""
+            return _parse_status_payload(data)
         code = extract_sms_code(data)
-        return (bool(code), code)
+        received_at = None
+        if isinstance(data, dict):
+            from .hero_sms_provider import extract_sms_received_at
+
+            received_at = extract_sms_received_at(data)
+        return SmsCodeStatus(bool(code), code, received_at)
+
+    def get_status(self, activation_id: int) -> tuple[bool, str]:
+        status = self.get_status_detail(activation_id)
+        return status.received, status.code
 
     def poll_for_code(self, activation_id: int, *, interval: float = 5.0, max_attempts: int = 60) -> str:
         for attempt in range(1, max_attempts + 1):

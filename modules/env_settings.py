@@ -32,6 +32,15 @@ SETTINGS: list[SettingItem] = [
     SettingItem("FREE_MAIL_SOURCE", "Free 邮箱源", "基础设置", "choice", ("moemail", "hotmail", "icloud_query"), help_text="Free 注册专用邮箱源；当前建议使用 moemail。"),
     SettingItem("USE_PROXY", "浏览器代理", "基础设置", "bool", help_text="开启后浏览器会从代理池取代理。"),
     SettingItem("PROXY_FILE", "代理池文件", "基础设置"),
+    SettingItem("RESIDENTIAL_PROXY_ENABLED", "动态住宅代理", "基础设置", "bool", help_text="开启后优先使用 Kookeey 等住宅代理，每次 pick 可轮换 session。"),
+    SettingItem("RESIDENTIAL_PROXY_SERVER", "住宅代理服务器", "基础设置"),
+    SettingItem("RESIDENTIAL_PROXY_PORT", "住宅代理端口", "基础设置", "int"),
+    SettingItem("RESIDENTIAL_PROXY_TYPE", "住宅代理协议", "基础设置", "choice", ("http", "socks5")),
+    SettingItem("RESIDENTIAL_PROXY_USERNAME", "住宅代理用户名", "基础设置"),
+    SettingItem("RESIDENTIAL_PROXY_PASSWORD", "住宅代理密码", "基础设置", masked=True, help_text="填基础密码（如 0259b3d8），程序会自动拼接 region/session/duration。"),
+    SettingItem("RESIDENTIAL_PROXY_REGION", "住宅代理地区", "基础设置", help_text="如 GB_England、US 等，留空则不拼接地区段。"),
+    SettingItem("RESIDENTIAL_PROXY_SESSION_DURATION", "住宅 IP 粘性", "基础设置", help_text="Kookeey 时长后缀，如 1m、5m、10m。"),
+    SettingItem("RESIDENTIAL_PROXY_SESSION_MODE", "住宅 session 模式", "基础设置", "choice", ("attempt", "worker", "random", "fixed"), help_text="attempt=每次尝试新 IP；worker=同线程固定；random=随机；fixed=固定 RESIDENTIAL_PROXY_SESSION。"),
     SettingItem("MOEMAIL_BASE_URL", "MoeMail 地址", "邮箱设置"),
     SettingItem("MOEMAIL_API_KEY", "MoeMail API Key", "邮箱设置", masked=True),
     SettingItem("MOEMAIL_DOMAIN_WHITELIST", "MoeMail 域名", "邮箱设置"),
@@ -92,6 +101,20 @@ SETTINGS: list[SettingItem] = [
     SettingItem("FLOW3_SMS_PROVIDER", "流程三接码平台", "流程接码", "choice", ("herosms", "grizzly", "fivesim"), section="流程三 OAuth授权"),
     SettingItem("FREE_SMS_ENABLED", "Free 接码", "流程接码", "bool", help_text="Free 注册必须开启，否则不会继续手机号注册。", section="功能五 Free注册"),
     SettingItem("FREE_SMS_PROVIDER", "Free 接码平台", "流程接码", "choice", ("herosms", "grizzly", "fivesim"), section="功能五 Free注册"),
+    SettingItem("CURSOR_MAIL_SOURCE", "Cursor 邮箱源", "Cursor 注册", "choice", ("moemail", "hotmail", "icloud_query"), section="Cursor 自动注册"),
+    SettingItem("CURSOR_BROWSER_INCOGNITO", "Cursor 无痕浏览器", "Cursor 注册", "bool", help_text="开启后 Cursor 注册使用 Chrome 无痕模式，不写入持久 profile。", section="Cursor 自动注册"),
+    SettingItem("CURSOR_SMS_ENABLED", "Cursor 接码", "Cursor 注册", "bool", help_text="Cursor 注册必须开启，否则不会继续手机验证。", section="Cursor 自动注册"),
+    SettingItem("CURSOR_SMS_PROVIDER", "Cursor 接码平台", "Cursor 注册", "choice", ("herosms", "grizzly", "fivesim"), section="Cursor 自动注册"),
+    SettingItem("CURSOR_SMS_SERVICE", "Cursor HeroSMS 服务", "Cursor 注册", help_text="固定 Any other，服务代码 ot，无需修改。", section="Cursor 自动注册"),
+    SettingItem(
+        "CURSOR_SMS_COUNTRY",
+        "Cursor 接码国家",
+        "Cursor 注册",
+        help_text="HeroSMS 国家，如 England、GB、HK。默认 England（英国 +44）。",
+        section="Cursor 自动注册",
+    ),
+    SettingItem("CURSOR_SMS_MAX_PRICE", "Cursor 最高接码价", "Cursor 注册", help_text="Any other 该国报价超过该值（美元）时不购买，默认 0.1。", section="Cursor 自动注册"),
+    SettingItem("CURSOR_CAPTCHA_MODE", "Cursor 验证码模式", "Cursor 注册", "choice", ("auto", "click", "api", "manual"), section="Cursor 自动注册"),
     SettingItem("HERO_SMS_API_KEY", "HeroSMS API Key", "流程一/三接码", masked=True, section="手机号接码"),
     SettingItem("HERO_SMS_SERVICE", "HeroSMS 服务", "流程一/三接码", section="手机号接码"),
     SettingItem("HERO_SMS_COUNTRY_TOP_N", "国家列表数量", "流程一/三接码", "int", section="手机号接码"),
@@ -290,6 +313,15 @@ WIZARD_SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
             "MOEMAIL_CREATE_MODE",
             "USE_PROXY",
             "PROXY_FILE",
+            "RESIDENTIAL_PROXY_ENABLED",
+            "RESIDENTIAL_PROXY_SERVER",
+            "RESIDENTIAL_PROXY_PORT",
+            "RESIDENTIAL_PROXY_TYPE",
+            "RESIDENTIAL_PROXY_USERNAME",
+            "RESIDENTIAL_PROXY_PASSWORD",
+            "RESIDENTIAL_PROXY_REGION",
+            "RESIDENTIAL_PROXY_SESSION_DURATION",
+            "RESIDENTIAL_PROXY_SESSION_MODE",
             "SMS_ENABLED",
             "SMS_PROVIDER",
             "HERO_SMS_API_KEY",
@@ -578,7 +610,11 @@ def config_status(values: dict[str, str]) -> dict[str, str]:
         "手机号": f"{phones}/3",
         "截图": "成功保留" if is_true(values.get("FLOW2_SAVE_SUCCESS_SCREENSHOTS", "")) else "仅失败",
         "HTML": "保留" if is_true(values.get("FLOW2_SAVE_HTML", "")) else "少写",
-        "代理": "开" if is_true(values.get("USE_PROXY", "")) else "关",
+        "代理": (
+            "住宅"
+            if is_true(values.get("RESIDENTIAL_PROXY_ENABLED", ""))
+            else ("开" if is_true(values.get("USE_PROXY", "")) else "关")
+        ),
         "邮箱源": values.get("MAIL_SOURCE", "") or "-",
         "流程一": flow_summary(values, "FLOW1"),
         "流程三": flow_summary(values, "FLOW3"),
@@ -920,7 +956,10 @@ def flow2_health_rows(path: Path, values: dict[str, str]) -> list[tuple[str, str
     rows.append(("流程2成功池", "OK" if paid_file.exists() else "WARN", str(paid_file)))
     if is_true(values.get("USE_PROXY", "")):
         proxy_ok, proxy_detail = check_path(values.get("PROXY_FILE", ""))
-        rows.append(("代理池", "OK" if proxy_ok else "WARN", proxy_detail))
+        if is_true(values.get("RESIDENTIAL_PROXY_ENABLED", "")):
+            rows.append(("住宅代理", "OK", f"{values.get('RESIDENTIAL_PROXY_SERVER', '')}:{values.get('RESIDENTIAL_PROXY_PORT', '1000')}"))
+        else:
+            rows.append(("代理池", "OK" if proxy_ok else "WARN", proxy_detail))
     if path.exists():
         rows.append((".env 文件", "OK", str(path)))
     else:

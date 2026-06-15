@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import re
@@ -8,10 +8,39 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Page
 
+from .captcha_auto import (
+    _captcha_mode,
+    _capsolver_key,
+    CAPTCHA_MAX_CLICK_ATTEMPTS,
+    CAPTCHA_RETRY_INTERVAL_SEC,
+    captcha_strategy_summary,
+    security_challenge_visible,
+    should_use_capsolver,
+    try_auto_clear_security_challenge,
+)
 from .utils import log, resolve_path, safe_filename
 
 
 SMS_CODE_CALLBACK = Callable[[], Awaitable[str]]
+
+
+def _is_chatgpt_root_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or "/"
+    return host == "chatgpt.com" and path == "/"
+
+
+AUTH_ROUTE_ERROR_HINTS = (
+    "route error",
+    "invalid content type",
+    "400 invalid content type",
+    "糟糕，出错了",
+    "oops, an error occurred",
+    "something went wrong",
+)
+
+AUTH_RETRY_TEXTS = ["重试", "再试一次", "Retry", "Try again"]
 
 
 class FreeBrowserFlow:
@@ -55,17 +84,137 @@ class FreeBrowserFlow:
             raise last_error
         raise RuntimeError("cannot open ChatGPT entry")
 
+    async def _security_challenge_visible(self) -> tuple[bool, str]:
+        return await security_challenge_visible(self.page)
+
+    async def auth_route_error_reason(self) -> str:
+        try:
+            text = await self.page.evaluate("() => document.body?.innerText || ''")
+        except Exception:
+            return ""
+        body = str(text or "")
+        haystack = f"{self.page.url or ''} {body}".lower()
+        for hint in AUTH_ROUTE_ERROR_HINTS:
+            if hint.lower() in haystack:
+                if hint.lower() in {"something went wrong", "oops, an error occurred"}:
+                    retry_hint = any(k in body.lower() for k in ("retry", "try again", "重试", "再试一次"))
+                    if not retry_hint:
+                        continue
+                return hint
+        return ""
+
+    async def recover_auth_route_error(
+        self,
+        *,
+        max_attempts: int = 2,
+        wait_ms: int = 12_000,
+        raise_on_failure: bool = True,
+    ) -> bool:
+        recovered = False
+        last_reason = ""
+        for attempt in range(1, max_attempts + 1):
+            reason = await self.auth_route_error_reason()
+            if not reason:
+                return recovered
+            recovered = True
+            last_reason = reason
+            self.say(f"[Browser] 检测到认证错误页 ({reason})，点击重试 ({attempt}/{max_attempts})")
+            clicked = False
+            try:
+                clicked = await self._find_clickable(AUTH_RETRY_TEXTS)
+            except Exception:
+                clicked = False
+            if not clicked:
+                self.say("[Browser] 未找到重试按钮，尝试刷新当前认证页")
+                try:
+                    await self.page.reload(wait_until="domcontentloaded", timeout=20_000)
+                except Exception as exc:
+                    self.say(f"[Browser] 刷新认证页失败: {exc.__class__.__name__}: {str(exc)[:120]}")
+
+            deadline = time.monotonic() + wait_ms / 1000
+            while time.monotonic() < deadline:
+                await self.sleep(700)
+                if not await self.auth_route_error_reason():
+                    self.say("[Browser] 认证错误页重试后已恢复")
+                    return True
+
+        if raise_on_failure:
+            raise RuntimeError(f"认证错误页重试后仍未恢复: {last_reason or self.page.url}")
+        return recovered
+
     async def wait_for_cloudflare(self, timeout_ms: int = 60_000) -> None:
         deadline = time.monotonic() + timeout_ms / 1000
+        last_log = 0.0
+        capsolver_tried = False
+        strategy_logged = False
+        click_attempts = 0
+        last_click_at = 0.0
         while time.monotonic() < deadline:
-            try:
-                title = (await self.page.title()).lower()
-                text = (await self.page.evaluate("() => (document.body?.innerText || '').toLowerCase()"))[:2000]
-                if "just a moment" not in title and "checking your browser" not in text and "cloudflare" not in title:
-                    return
-            except Exception:
-                pass
+            if await self.recover_auth_route_error(max_attempts=2, wait_ms=10_000):
+                last_log = 0.0
+                continue
+            visible, reason = await self._security_challenge_visible()
+            if not visible:
+                return
+            if not strategy_logged:
+                self.say(f"[Captcha] 安全验证策略: {captcha_strategy_summary()}")
+                strategy_logged = True
+            now = time.monotonic()
+            can_click = click_attempts == 0 or (
+                click_attempts < CAPTCHA_MAX_CLICK_ATTEMPTS
+                and now - last_click_at >= CAPTCHA_RETRY_INTERVAL_SEC
+            )
+            if can_click:
+                click_attempts += 1
+                last_click_at = now
+                if await try_auto_clear_security_challenge(
+                    self.page,
+                    self.say,
+                    try_capsolver=not capsolver_tried,
+                    attempt=click_attempts,
+                    max_attempts=CAPTCHA_MAX_CLICK_ATTEMPTS,
+                    log_strategy=click_attempts <= 1,
+                ):
+                    if not capsolver_tried and should_use_capsolver() and _capsolver_key():
+                        capsolver_tried = True
+                    await self.sleep(1200)
+                    if not (await self._security_challenge_visible())[0]:
+                        self.say("[Browser] 安全验证已自动通过")
+                        return
+                elif not capsolver_tried and should_use_capsolver() and _capsolver_key():
+                    capsolver_tried = True
+            now = time.monotonic()
+            if now - last_log >= 8:
+                self.say(
+                    f"[Browser] 等待安全验证通过 ({reason})..."
+                    f" Captcha {click_attempts}/{CAPTCHA_MAX_CLICK_ATTEMPTS}"
+                )
+                last_log = now
+            await self.sleep(800)
+
+        visible, reason = await self._security_challenge_visible()
+        if not visible:
+            return
+
+        if await try_auto_clear_security_challenge(self.page, self.say):
+            await self.sleep(2500)
+            if not (await self._security_challenge_visible())[0]:
+                self.say("[Browser] 安全验证已自动通过")
+                return
+
+        if _captcha_mode() == "api":
+            raise RuntimeError(f"安全验证自动求解未通过: {reason or self.page.url}")
+
+        self.say(f"[Browser] 安全验证仍未通过 ({reason})，请在浏览器窗口手动完成验证")
+        manual_deadline = time.monotonic() + 180
+        while time.monotonic() < manual_deadline:
+            visible, reason = await self._security_challenge_visible()
+            if not visible:
+                self.say("[Browser] 安全验证已通过")
+                return
             await self.sleep(2000)
+
+        raise RuntimeError(f"安全验证超时: {reason or self.page.url}")
 
     async def wait_for_text_on_page(self, text: str | list[str], timeout_ms: int = 30_000) -> None:
         candidates = text if isinstance(text, list) else [text]
@@ -144,6 +293,9 @@ class FreeBrowserFlow:
     async def wait_for_email_input(self, timeout_ms: int = 30_000):
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
+            visible, reason = await self._security_challenge_visible()
+            if visible:
+                await self.wait_for_cloudflare(min(90_000, int((deadline - time.monotonic()) * 1000)))
             loc = await self._find_email_input()
             if loc is not None:
                 ok, meta = await self._is_probable_auth_input(loc)
@@ -286,6 +438,709 @@ class FreeBrowserFlow:
         if any(h in low for h in hints):
             raise RuntimeError("email already registered")
 
+    async def body_text(self) -> str:
+        try:
+            return str(await self.page.evaluate("() => document.body?.innerText || ''") or "")
+        except Exception:
+            return ""
+
+    async def _has_visible_selector(self, selector: str) -> bool:
+        try:
+            return bool(
+                await self.page.evaluate(
+                    """(selector) => {
+                        const visible = (el) => {
+                            const r = el.getBoundingClientRect();
+                            const s = getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                        };
+                        return Array.from(document.querySelectorAll(selector)).some(visible);
+                    }""",
+                    selector,
+                )
+            )
+        except Exception:
+            return False
+
+    async def _about_you_visible(self, low_text: str) -> bool:
+        url = (self.page.url or "").lower()
+        if "about-you" in url or "onboarding/profile" in url:
+            return True
+        hints = (
+            "about you",
+            "tell us about you",
+            "your name",
+            "birthday",
+            "birth date",
+            "age",
+            "关于你",
+            "你的姓名",
+            "出生",
+            "年龄",
+        )
+        if not any(h in low_text for h in hints):
+            return False
+        return await self._has_visible_selector(
+            'input[name*="name" i], input[placeholder*="name" i], input[id*="name" i], '
+            'input[name*="age" i], input[placeholder*="age" i], input[id*="age" i], '
+            'input[name*="birth" i], input[placeholder*="birth" i], input[type="date"], '
+            'input[placeholder*="姓名"], input[placeholder*="年龄"], input[placeholder*="出生"]'
+        )
+
+    async def _phone_required_visible(self, low_text: str) -> bool:
+        url = (self.page.url or "").lower()
+        if any(k in url for k in ("add-phone", "phone-verification", "contact-verification")):
+            return True
+        if await self._has_visible_selector(
+            'input[name="phoneNumberInput"], input[type="tel"], '
+            'input[name*="phone" i], input[placeholder*="phone" i], input[aria-label*="phone" i], '
+            'input[placeholder*="手机号"], input[aria-label*="手机号"], input[placeholder*="电话"]'
+        ):
+            return True
+        phone_hints = (
+            "verify your phone",
+            "phone verification",
+            "add a phone",
+            "add your phone",
+            "enter your phone number",
+            "sms code",
+            "text message",
+            "手机号验证",
+            "短信验证码",
+            "输入手机号",
+            "手机号码",
+        )
+        return any(h in low_text for h in phone_hints)
+
+    async def has_combined_verification_profile_page(self) -> bool:
+        return await self._is_combined_verification_profile_page()
+
+    async def detect_free_email_register_state(self) -> str:
+        if await self.recover_auth_route_error(max_attempts=1, wait_ms=5_000, raise_on_failure=False):
+            return "recovered"
+        visible, _ = await self._security_challenge_visible()
+        if visible:
+            return "security_challenge"
+        text = await self.body_text()
+        low = text.lower()
+        is_chatgpt_root = _is_chatgpt_root_url(self.page.url or "")
+        root_has_register = is_chatgpt_root and (
+            any(h in text for h in ("注册", "免费注册", "创建账号", "创建帐户"))
+            or any(h in low for h in ("sign up", "create account", "register"))
+        )
+        root_has_upgrade = is_chatgpt_root and ("升级" in text or "upgrade" in low)
+        if root_has_upgrade and not root_has_register:
+            return "complete_home"
+        if any(
+            h in low
+            for h in (
+                "already have an account",
+                "already registered",
+                "email already",
+                "邮箱已被注册",
+                "此邮箱已",
+            )
+        ):
+            return "email_already_registered"
+        if await self._phone_required_visible(low):
+            return "phone_required"
+        if await self._has_visible_selector('input[type="password"]'):
+            return "password"
+        if await self._about_you_visible(low):
+            return "about_you"
+        if await self._wait_for_code_stage(timeout_ms=250):
+            return "email_code"
+        if any(
+            h in low
+            for h in (
+                "使用通行密钥创建账户",
+                "通行密钥",
+                "create a passkey",
+                "create passkey",
+                "create an account with a passkey",
+                "create account with passkey",
+                "passkey",
+            )
+        ) and any(h in low for h in ("跳过", "稍后", "skip", "not now", "maybe later")):
+            return "passkey"
+        if any(
+            h in low or h in text
+            for h in (
+                "是什么促使你使用 chatgpt",
+                "是什么促使你使用 ChatGPT",
+                "什么促使你使用 chatgpt",
+                "what brings you to chatgpt",
+                "what brings you here",
+                "what are you using chatgpt for",
+            )
+        ) and any(h in low or h in text for h in ("跳过", "skip")):
+            return "usage_reason"
+        if any(
+            h in low
+            for h in (
+                "全新 chatgpt images 2.0 重磅登场",
+                "chatgpt images 2.0",
+                "images 2.0",
+            )
+        ) and any(h in low for h in ("暂不", "以后再说", "not now", "maybe later", "skip")):
+            return "images_upsell"
+        email_input = await self._find_email_input()
+        if email_input is not None:
+            ok, _ = await self._is_probable_auth_input(email_input)
+            if ok:
+                return "email"
+        if root_has_register:
+            return "entry"
+        if root_has_upgrade:
+            return "complete_home"
+        ready_primary = any(
+            h in low
+            for h in (
+                "you're all set",
+                "you are all set",
+                "ready to go",
+                "get started",
+                "你已准备就绪",
+                "您已准备就绪",
+                "准备就绪",
+            )
+        )
+        ready_secondary = any(h in low for h in ("chatgpt can make mistakes", "chatgpt 可能会出错", "请勿分享敏感信息"))
+        ready_action = any(h in low for h in ("continue", "get started", "start", "继续", "开始"))
+        if ready_primary or (ready_secondary and ready_action):
+            return "ready_continue"
+        if any(
+            h in low
+            for h in (
+                "sign up",
+                "sign up for free",
+                "continue with email",
+                "use email",
+                "注册",
+                "继续使用邮箱",
+                "邮箱",
+            )
+        ):
+            return "entry"
+        return "unknown"
+
+    async def click_ready_continue(self) -> bool:
+        try:
+            await self.click_button_by_text(
+                [
+                    "Continue",
+                    "Get started",
+                    "Start using ChatGPT",
+                    "继续",
+                    "开始",
+                    "开始使用 ChatGPT",
+                ],
+                timeout_ms=8_000,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def click_usage_reason_skip(self) -> bool:
+        try:
+            await self.click_button_by_text(
+                [
+                    "跳过",
+                    "Skip",
+                    "稍后",
+                    "Not now",
+                ],
+                timeout_ms=8_000,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def click_images_upsell_dismiss(self) -> bool:
+        try:
+            await self.click_button_by_text(
+                [
+                    "暂不",
+                    "以后再说",
+                    "Not now",
+                    "Maybe later",
+                    "Skip",
+                ],
+                timeout_ms=8_000,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _dismiss_chatgpt_composer_blockers(self) -> None:
+        for labels in (
+            ["暂不", "以后再说", "Not now", "Maybe later", "Skip", "Close", "关闭", "Dismiss", "取消", "Later", "後で"],
+            ["New chat", "新聊天", "新規チャット", "新しいチャット"],
+            ["Start chatting", "开始聊天", "チャットを始める"],
+        ):
+            try:
+                await self.click_button_by_text(labels, timeout_ms=700)
+                await self.sleep(350)
+            except Exception:
+                continue
+
+    async def send_chatgpt_smoke_message(self, prompt: str = "你好", timeout_ms: int = 90_000) -> str:
+        await self.wait_for_cloudflare(30_000)
+        await self._dismiss_chatgpt_composer_blockers()
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=5_000)
+        except Exception:
+            pass
+        before_count = 0
+        try:
+            before_count = int(
+                await self.page.evaluate(
+                    """() => document.querySelectorAll('[data-message-author-role="assistant"]').length"""
+                )
+            )
+        except Exception:
+            before_count = 0
+
+        selectors = (
+            'div#prompt-textarea.ProseMirror[contenteditable="true"]',
+            'div#prompt-textarea[contenteditable="true"]',
+            '#prompt-textarea',
+            '[data-testid="prompt-textarea"]',
+            'textarea[placeholder*="Message" i]',
+            'textarea[placeholder*="Ask" i]',
+            'textarea[placeholder*="消息"]',
+            'textarea[placeholder*="发送"]',
+            'textarea[placeholder*="メッセージ"]',
+            'textarea[placeholder*="質問"]',
+            'textarea[data-testid]',
+            'div[contenteditable="true"][role="textbox"]',
+            'div[contenteditable="true"][data-placeholder]',
+            '[contenteditable="true"][data-testid*="prompt" i]',
+            'form [contenteditable="true"]',
+            'main [contenteditable="true"]',
+            'textarea[placeholder]',
+        )
+
+        async def try_dom_fill_composer() -> bool:
+            try:
+                result = await self.page.evaluate(
+                    """(value) => {
+                        // chatgptComposerSmokeFill
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 &&
+                                rect.height > 0 &&
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                Number(style.opacity || '1') > 0.01;
+                        };
+                        const setTextarea = (el, text) => {
+                            const proto = Object.getPrototypeOf(el);
+                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc && typeof desc.set === 'function') {
+                                desc.set.call(el, text);
+                            } else {
+                                el.value = text;
+                            }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        };
+                        const dispatchTextInput = (el, text) => {
+                            el.focus();
+                            const selection = window.getSelection();
+                            if (selection) {
+                                const range = document.createRange();
+                                range.selectNodeContents(el);
+                                range.collapse(false);
+                                selection.removeAllRanges();
+                                selection.addRange(range);
+                            }
+                            let inserted = false;
+                            try {
+                                inserted = document.execCommand('insertText', false, text);
+                            } catch {}
+                            if (!inserted || !String(el.innerText || el.textContent || '').includes(text)) {
+                                el.textContent = '';
+                                const p = document.createElement('p');
+                                p.textContent = text;
+                                el.appendChild(p);
+                            }
+                            el.dispatchEvent(new InputEvent('beforeinput', {
+                                bubbles: true,
+                                cancelable: true,
+                                inputType: 'insertText',
+                                data: text,
+                            }));
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true,
+                                inputType: 'insertText',
+                                data: text,
+                            }));
+                        };
+
+                        const editors = Array.from(document.querySelectorAll([
+                            'div#prompt-textarea.ProseMirror[contenteditable="true"]',
+                            '#prompt-textarea[contenteditable="true"]',
+                            '.ProseMirror[contenteditable="true"]',
+                            '[data-composer-surface="true"] [contenteditable="true"]',
+                            'div[contenteditable="true"][data-placeholder]',
+                            'div[contenteditable="true"][role="textbox"]',
+                            'main [contenteditable="true"]'
+                        ].join(','))).filter(visible);
+                        if (editors.length) {
+                            dispatchTextInput(editors[0], String(value));
+                            const fallback = document.querySelector('textarea[name="prompt-textarea"], textarea.wcDTda_fallbackTextarea');
+                            if (fallback) setTextarea(fallback, String(value));
+                            return { filled: true, mode: 'contenteditable', text: editors[0].innerText || '' };
+                        }
+
+                        const textareas = Array.from(document.querySelectorAll([
+                            'textarea[name="prompt-textarea"]',
+                            'textarea[placeholder]',
+                            'textarea[data-testid]'
+                        ].join(','))).filter(visible);
+                        if (textareas.length) {
+                            setTextarea(textareas[0], String(value));
+                            textareas[0].focus();
+                            return { filled: true, mode: 'textarea', text: textareas[0].value || '' };
+                        }
+                        return { filled: false, mode: 'not-found', text: '' };
+                    }""",
+                    prompt,
+                )
+                return bool(isinstance(result, dict) and result.get("filled"))
+            except Exception:
+                return False
+
+        async def try_prepare_composer() -> None:
+            await self._dismiss_chatgpt_composer_blockers()
+
+        async def try_fill_locator(loc, prompt_text: str) -> bool:
+            try:
+                if await loc.count() <= 0:
+                    return False
+                try:
+                    await loc.wait_for(state="visible", timeout=2_500)
+                except Exception:
+                    if not await loc.is_visible(timeout=800):
+                        return False
+                await loc.click(timeout=2_000)
+                tag_name = ""
+                try:
+                    tag_name = str(await loc.evaluate("(el) => el.tagName.toLowerCase()"))
+                except Exception:
+                    tag_name = ""
+                if tag_name == "textarea":
+                    await loc.fill(prompt_text, timeout=4_000)
+                else:
+                    try:
+                        await loc.fill(prompt_text, timeout=4_000)
+                    except Exception:
+                        await loc.evaluate(
+                            """(el, value) => {
+                                el.focus();
+                                el.innerText = String(value);
+                                el.dispatchEvent(new InputEvent('input', {
+                                    bubbles: true,
+                                    inputType: 'insertText',
+                                    data: String(value),
+                                }));
+                            }""",
+                            prompt_text,
+                        )
+                return True
+            except Exception:
+                try:
+                    await loc.click(timeout=1_500)
+                    await loc.press_sequentially(prompt_text, delay=25)
+                    return True
+                except Exception:
+                    return False
+
+        filled = False
+        navigated_home = False
+        fill_deadline = time.monotonic() + min(60, max(12, timeout_ms / 1000 / 2))
+        while time.monotonic() < fill_deadline and not filled:
+            try:
+                test_id_loc = self.page.get_by_test_id("prompt-textarea").first
+                filled = await try_fill_locator(test_id_loc, prompt)
+            except Exception:
+                filled = False
+            if filled:
+                break
+            for selector in selectors:
+                try:
+                    loc = self.page.locator(selector).first
+                    if await try_fill_locator(loc, prompt):
+                        filled = True
+                        break
+                except Exception:
+                    continue
+            if not filled:
+                filled = await try_dom_fill_composer()
+            if filled:
+                break
+            await try_prepare_composer()
+            if not navigated_home and "chatgpt.com" in (self.page.url or "").lower() and time.monotonic() + 20 < fill_deadline:
+                navigated_home = True
+                try:
+                    await self.page.goto("https://chatgpt.com/?model=auto", wait_until="domcontentloaded", timeout=30_000)
+                    await self.wait_for_cloudflare(30_000)
+                except Exception:
+                    pass
+            await self.sleep(1000)
+
+        if not filled:
+            raise RuntimeError(f"未找到 ChatGPT 输入框，无法发送探测消息: {self.page.url}")
+
+        await self.sleep(300)
+        clicked = False
+        for selector in (
+            '[data-testid="send-button"]',
+            '[data-testid="composer-submit-button"]',
+            'button[aria-label*="Send" i]',
+            'button[aria-label*="发送" i]',
+            'button:has-text("Send")',
+            'button:has-text("发送")',
+        ):
+            try:
+                btn = self.page.locator(selector).first
+                if await btn.count() <= 0:
+                    continue
+                if not await btn.is_visible(timeout=600):
+                    continue
+                await btn.click(timeout=2000)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            await self.page.keyboard.press("Enter")
+
+        deadline = time.monotonic() + timeout_ms / 1000
+        last_reply = ""
+        while time.monotonic() < deadline:
+            try:
+                result = await self.page.evaluate(
+                    """(beforeCount) => {
+                        const nodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+                        const latest = nodes.length ? String(nodes[nodes.length - 1].innerText || '').trim() : '';
+                        const stopVisible = Array.from(document.querySelectorAll('button,[role="button"]')).some((el) => {
+                            const text = String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 &&
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                (text.includes('stop') || text.includes('停止'));
+                        });
+                        return { count: nodes.length, latest, stopVisible };
+                    }""",
+                    before_count,
+                )
+                if isinstance(result, dict):
+                    latest = str(result.get("latest") or "").strip()
+                    if latest:
+                        last_reply = latest
+                    if int(result.get("count") or 0) > before_count and latest and not bool(result.get("stopVisible")):
+                        return latest
+            except Exception:
+                pass
+            await self.sleep(1000)
+
+        if last_reply:
+            return last_reply
+        raise RuntimeError("等待 ChatGPT 回复超时")
+
+    async def click_passkey_skip(self) -> bool:
+        try:
+            await self.click_button_by_text(
+                [
+                    "Skip",
+                    "Not now",
+                    "Maybe later",
+                    "Continue without passkey",
+                    "跳过",
+                    "稍后",
+                    "暂不",
+                    "以后再说",
+                ],
+                timeout_ms=8_000,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def click_signup_email_entry(self) -> bool:
+        try:
+            await self.click_button_by_text(["Reject non-essential", "拒绝非必需", "Accept all", "全部接受"], 2_000)
+        except Exception:
+            pass
+        if await self._find_email_input() is not None:
+            return True
+        clicked = False
+        try:
+            await self.click_button_by_text(["Sign up", "Sign up for free", "免费注册", "注册"], 4_000)
+            clicked = True
+        except Exception:
+            pass
+        try:
+            await self.click_button_by_text(["Continue with email", "Use email", "Email", "继续使用邮箱", "邮箱"], 3_000)
+            clicked = True
+        except Exception:
+            pass
+        return clicked or (await self._find_email_input() is not None)
+
+    async def _click_email_submit_near_input(self, email_input) -> bool:
+        try:
+            result = await asyncio.wait_for(
+                email_input.evaluate(
+                    """(input) => {
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0
+                                && style.display !== 'none'
+                                && style.visibility !== 'hidden';
+                        };
+                        const text = (el) => String(
+                            el?.innerText || el?.textContent || el?.value
+                            || el?.getAttribute?.('aria-label')
+                            || el?.getAttribute?.('title')
+                            || el?.getAttribute?.('data-testid')
+                            || ''
+                        ).replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const blocked = (el) => /google|apple|microsoft|github|sso|oauth|social|provider|phone|手机|电话|手机号/.test(
+                            `${text(el)} ${el?.outerHTML || ''}`.toLowerCase()
+                        );
+                        const wanted = (el) => {
+                            const value = text(el);
+                            return /^(continue|next|submit|log in|sign in|sign up|create|verify|继续|下一步|登录|注册|提交|验证)$/.test(value)
+                                || /continue|next|submit|login|sign in|sign up|verify|继续|下一步|登录|注册|提交|验证/.test(value);
+                        };
+                        const activate = (target) => {
+                            target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                            target.focus?.();
+                            target.click();
+                            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach((type) => {
+                                target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                            });
+                            const form = target.closest?.('form') || input.closest?.('form');
+                            if (form && typeof form.requestSubmit === 'function') {
+                                setTimeout(() => {
+                                    try { form.requestSubmit(target instanceof HTMLButtonElement ? target : undefined); } catch {}
+                                }, 50);
+                            }
+                        };
+                        const form = input.closest('form');
+                        const scopes = [
+                            form,
+                            input.closest('[role="dialog"], dialog, [aria-modal="true"], [data-radix-dialog-content]'),
+                            input.closest('section'),
+                            input.closest('main'),
+                            input.closest('[role="main"]'),
+                            document
+                        ].filter(Boolean);
+                        for (const scope of scopes) {
+                            const buttons = Array.from(scope.querySelectorAll('button, input[type="submit"], [role="button"]'))
+                                .filter((el) => visible(el) && !el.disabled && !blocked(el));
+                            const preferred = buttons.find(wanted);
+                            if (preferred) {
+                                activate(preferred);
+                                return { clicked: true, mode: 'preferred', label: text(preferred) };
+                            }
+                            if (scope === form && buttons.length === 1) {
+                                activate(buttons[0]);
+                                return { clicked: true, mode: 'single-form-button', label: text(buttons[0]) };
+                            }
+                        }
+                        input.focus();
+                        input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter' }));
+                        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter' }));
+                        if (form && typeof form.requestSubmit === 'function') {
+                            try {
+                                form.requestSubmit();
+                                return { clicked: true, mode: 'form-request-submit', label: '' };
+                            } catch {}
+                        }
+                        return { clicked: false, mode: 'not-found', label: '' };
+                    }"""
+                ),
+                timeout=2.5,
+            )
+            if isinstance(result, dict) and result.get("clicked"):
+                self.say(f"[Browser] clicked email confirm: {result.get('mode')} {result.get('label') or ''}".rstrip())
+                try:
+                    await self.page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                return True
+        except Exception as exc:
+            self.say(f"[Browser] email confirm click failed: {exc.__class__.__name__}: {str(exc)[:120]}")
+        try:
+            await self.page.keyboard.press("Enter")
+            self.say("[Browser] pressed Enter for email confirm")
+            return True
+        except Exception:
+            return False
+
+    async def wait_for_post_email_state(self, timeout_ms: int = 8_000) -> str:
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            state = await self.detect_free_email_register_state()
+            if state in {"email_code", "password", "about_you", "phone_required", "email_already_registered"}:
+                return state
+            if state == "recovered":
+                await self.sleep(500)
+                continue
+            await self.sleep(500)
+        return await self.detect_free_email_register_state()
+
+    async def submit_email_if_present(self, email: str) -> bool:
+        email_input = await self.wait_for_email_input(2_000)
+        if email_input is None:
+            return False
+        before = self.page.url
+        for attempt in range(1, 4):
+            refreshed = await self.wait_for_email_input(1_500)
+            if refreshed is not None:
+                email_input = refreshed
+            try:
+                current_value = await email_input.input_value(timeout=800)
+            except Exception:
+                current_value = ""
+            if str(current_value or "").strip().lower() != email.strip().lower():
+                await email_input.click(click_count=3)
+                await email_input.fill("")
+                await email_input.type(email, delay=30)
+                await self.sleep(500)
+            clicked = await self._click_email_submit_near_input(email_input)
+            if not clicked:
+                self.say(f"[Browser] email confirm button not found on attempt {attempt}")
+            next_state = await self.wait_for_post_email_state(timeout_ms=8_000)
+            if next_state == "email_already_registered":
+                await self.detect_email_already_registered()
+                raise RuntimeError("email already registered")
+            if next_state in {"email_code", "password", "about_you", "phone_required"}:
+                self.say(f"[Browser] email submit advanced to {next_state} on attempt {attempt}")
+                break
+            await self.detect_email_already_registered()
+            if await self.recover_auth_route_error(max_attempts=2, wait_ms=8_000):
+                continue
+            self.say(f"[Browser] email submit still on {next_state} (attempt {attempt})")
+            try:
+                await self.page.wait_for_load_state("domcontentloaded", timeout=1_500)
+            except Exception:
+                pass
+            await self.sleep(800)
+        await self.wait_for_url_change(before, timeout_ms=3_000)
+        await self.wait_for_cloudflare(60_000)
+        await self.detect_email_already_registered()
+        return True
+
     async def navigate_to_signup(self) -> None:
         await self.goto_chatgpt_entry(timeout_ms=60_000)
         await self.wait_for_cloudflare()
@@ -335,6 +1190,17 @@ class FreeBrowserFlow:
             refreshed = await self.wait_for_email_input(1_500)
             if refreshed is not None:
                 email_input = refreshed
+                try:
+                    current_value = await email_input.input_value(timeout=800)
+                except Exception:
+                    current_value = ""
+                if str(current_value or "").strip().lower() != email.strip().lower():
+                    try:
+                        await email_input.click(click_count=3)
+                        await email_input.fill("")
+                        await email_input.type(email, delay=30)
+                    except Exception:
+                        pass
             try:
                 clicked_form_submit = await asyncio.wait_for(
                     email_input.evaluate(
@@ -381,25 +1247,139 @@ class FreeBrowserFlow:
                 self.say(f"[Browser] email submit advanced to code stage on attempt {attempt}")
                 break
             self.say(f"[Browser] email submit did not reach code stage (attempt {attempt})")
+            if await self.recover_auth_route_error(max_attempts=2, wait_ms=8_000):
+                continue
             try:
                 await self.page.wait_for_load_state("domcontentloaded", timeout=1_500)
             except Exception:
                 pass
             await self.sleep(800)
         await self.wait_for_url_change(before, timeout_ms=10_000)
-        await self.wait_for_cloudflare(30_000)
+        await self.wait_for_cloudflare(90_000)
         await self.detect_email_already_registered()
 
     async def click_resend_code(self) -> bool:
         try:
-            await self.click_button_by_text(["Resend", "Send again", "重新发送", "再次发送"], 6000)
+            await self.click_button_by_text(
+                [
+                    "Send code",
+                    "Send verification code",
+                    "Send email",
+                    "Resend",
+                    "Send again",
+                    "发送验证码",
+                    "发送验证代码",
+                    "发送代码",
+                    "发送邮件",
+                    "重新发送",
+                    "再次发送",
+                    "重发",
+                ],
+                6000,
+            )
             return True
         except Exception:
             return False
 
+    async def _fill_verification_code_by_dom(self, code: str) -> bool:
+        digits = re.sub(r"\D+", "", str(code or ""))[:8]
+        if not digits:
+            return False
+        try:
+            result = await self.page.evaluate(
+                """(code) => {
+                    const visible = (el) => {
+                        if (!el || el.disabled || el.readOnly) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 2 && rect.height > 2
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity || '1') > 0.01;
+                    };
+                    const textOf = (el) => String([
+                        el.getAttribute('name'),
+                        el.getAttribute('id'),
+                        el.getAttribute('autocomplete'),
+                        el.getAttribute('inputmode'),
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('placeholder'),
+                        el.getAttribute('data-testid'),
+                        el.getAttribute('type')
+                    ].filter(Boolean).join(' ')).toLowerCase();
+                    const pageText = String(document.body?.innerText || '').toLowerCase();
+                    const pageLooksCode = /verification code|enter code|check your email|one-time|otp|验证码|验证代码|输入代码|输入验证码/.test(pageText);
+                    const blocked = (el) => /email|mail|邮箱|password|pass|密码|name|姓名|age|年龄|birth|生日|phone|tel|手机|电话/.test(textOf(el));
+                    const isCodeLike = (el) => {
+                        const hint = textOf(el);
+                        const maxLength = Number(el.getAttribute('maxlength') || 0);
+                        return /code|otp|one-time|verification|验证码|验证代码|代码/.test(hint)
+                            || el.getAttribute('autocomplete') === 'one-time-code'
+                            || el.getAttribute('inputmode') === 'numeric'
+                            || el.getAttribute('type') === 'tel'
+                            || (pageLooksCode && maxLength > 0 && maxLength <= 8 && !blocked(el));
+                    };
+                    const setValue = (el, value) => {
+                        el.focus?.();
+                        const proto = Object.getPrototypeOf(el);
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (desc && typeof desc.set === 'function') {
+                            desc.set.call(el, '');
+                            desc.set.call(el, String(value));
+                        } else {
+                            el.value = String(value);
+                        }
+                        for (const type of ['beforeinput', 'input', 'change', 'keyup']) {
+                            try { el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true })); } catch {}
+                        }
+                    };
+                    const all = Array.from(document.querySelectorAll('input, textarea'))
+                        .filter((el) => visible(el) && !blocked(el));
+                    let candidates = all.filter(isCodeLike);
+                    if (!candidates.length && pageLooksCode) {
+                        candidates = all.filter((el) => {
+                            const type = String(el.getAttribute('type') || 'text').toLowerCase();
+                            return ['text', 'tel', 'number', ''].includes(type);
+                        });
+                    }
+                    if (!candidates.length) {
+                        return { filled: false, mode: 'not-found', count: 0 };
+                    }
+
+                    const single = candidates.find((el) => {
+                        const maxLength = Number(el.getAttribute('maxlength') || 0);
+                        return maxLength >= code.length || maxLength === 0 || el.tagName.toLowerCase() === 'textarea';
+                    });
+                    if (single && candidates.length < 6) {
+                        setValue(single, code);
+                        return { filled: true, mode: 'single', count: candidates.length };
+                    }
+
+                    const boxes = candidates.slice(0, code.length);
+                    if (boxes.length >= Math.min(6, code.length)) {
+                        boxes.forEach((el, idx) => setValue(el, code[idx] || ''));
+                        return { filled: true, mode: 'split', count: boxes.length };
+                    }
+
+                    setValue(candidates[0], code);
+                    return { filled: true, mode: 'fallback-single', count: candidates.length };
+                }""",
+                digits,
+            )
+            if isinstance(result, dict) and result.get("filled"):
+                self.say(f"[Browser] verification code filled by DOM: {result.get('mode')} count={result.get('count')}")
+                return True
+        except Exception as exc:
+            self.say(f"[Browser] DOM 填写验证码失败: {exc.__class__.__name__}: {str(exc)[:120]}")
+        return False
+
     async def enter_sms_code(self, code: str) -> None:
+        await self.wait_for_cloudflare(90_000)
+        if await self._fill_verification_code_by_dom(code):
+            await self.sleep(800)
+            return
         inputs = self.page.locator(
-            'input[name="code"], input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="tel"], input[type="text"]'
+            'input[name*="code" i], input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="tel"]'
         )
         await inputs.first.wait_for(timeout=20_000)
         count = await inputs.count()
@@ -424,10 +1404,16 @@ class FreeBrowserFlow:
         await self.click_submit_button()
         await self.wait_for_url_change(before, timeout_ms=15_000)
         await self.wait_for_cloudflare(30_000)
+        await self.recover_auth_route_error(max_attempts=2, wait_ms=10_000)
 
     async def _wait_for_code_stage(self, timeout_ms: int = 20_000) -> bool:
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
+            try:
+                if await self.recover_auth_route_error(max_attempts=1, wait_ms=5_000, raise_on_failure=False):
+                    continue
+            except Exception:
+                pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -795,6 +1781,39 @@ class FreeBrowserFlow:
                 filled_any = (await self._fill_first_visible_input(['input[name*="day" i]', 'input[placeholder*="day" i]'], d)) or filled_any
 
             if not filled_any:
+                body_hints = (
+                    "about you",
+                    "tell us",
+                    "your name",
+                    "birthday",
+                    "birth",
+                    "age",
+                    "关于你",
+                    "你的姓名",
+                    "出生",
+                    "年龄",
+                )
+                still_on_profile = any(k in body for k in body_hints)
+                on_auth = "auth.openai.com" in (self.page.url or "").lower()
+                combined = await self._is_combined_verification_profile_page()
+                if (still_on_profile or combined) and on_auth:
+                    self.say(f"{tag} fields already filled on step {step}, retry submit")
+                    before = self.page.url
+                    await self.sleep(120)
+                    try:
+                        await self.click_button_by_text(
+                            ["Continue", "继续", "下一步", "Submit", "提交"],
+                            timeout_ms=1_500,
+                        )
+                    except Exception:
+                        await self.click_submit_button()
+                    await self.wait_for_url_change(before, timeout_ms=3_000)
+                    try:
+                        await self.page.wait_for_load_state("domcontentloaded", timeout=1_200)
+                    except Exception:
+                        pass
+                    await self.wait_for_cloudflare(2_500)
+                    continue
                 self.say(f"{tag} no fillable fields on step {step}, skip submit")
                 break
 
@@ -875,13 +1894,21 @@ class FreeBrowserFlow:
         await self.sleep(500)
         await self.click_submit_button()
 
-    async def complete_profile(self, profile: Any, sms_code_callback: SMS_CODE_CALLBACK) -> bool:
+    async def complete_profile(
+        self,
+        profile: Any,
+        sms_code_callback: SMS_CODE_CALLBACK,
+        *,
+        skip_about_you: bool = False,
+    ) -> bool:
         code = await sms_code_callback()
         if not code:
             raise RuntimeError("empty sms code")
         await self.enter_sms_code(code)
         await self.click_submit_button()
         await self.wait_for_cloudflare(30_000)
+        if skip_about_you:
+            return True
 
         await self.fill_password_if_shown(getattr(profile, "password", ""))
         await self.sleep(1200)
@@ -945,6 +1972,8 @@ class FreeBrowserFlow:
 
         deadline = time.monotonic() + 420
         while time.monotonic() < deadline:
+            if await self.recover_auth_route_error(max_attempts=2, wait_ms=10_000):
+                continue
             url = self.page.url
             if self._is_redirect_callback(url, redirect_base):
                 return url
