@@ -30,6 +30,8 @@ profiles/
 浏览器插件版 可用于替换流程一/output/
 *.log
 *.tmp
+_tmp_line.txt
+hero_services.txt
 
 # Bundled/generated toolchains
 tools/android-build/
@@ -49,6 +51,8 @@ config.yaml
 
 # Sensitive pool/runtime data under data/
 data/**/mail_pool.txt
+data/**/accounts_pool.txt
+data/**/accounts_backup*.txt
 data/**/accounts.private.txt
 data/**/phones.private.txt
 data/**/cards.private.txt

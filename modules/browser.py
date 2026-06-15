@@ -134,6 +134,27 @@ async def _apply_storage_state(context: BrowserContext, path: Path) -> None:
         log(f"[Browser] 加载 CF 会话失败: {exc.__class__.__name__}: {exc}")
 
 
+def _prefer_playwright_proxy_for_incognito(proxy: str | None) -> bool:
+    """Chrome CDP 的 --proxy-server 无法处理链式/Kookeey 鉴权，易报 ERR_PROXY_AUTH_UNSUPPORTED。"""
+    proxy_cfg = parse_proxy(proxy)
+    if not proxy_cfg:
+        return bool((proxy or "").strip())
+    if proxy_cfg.get("username") or proxy_cfg.get("password"):
+        return True
+    server = (proxy_cfg.get("server") or "").lower()
+    if server.startswith("http://127.0.0.1:") or server.startswith("http://localhost:"):
+        try:
+            from .residential_proxy import load_residential_proxy_config
+            from .utils import load_env
+
+            cfg = load_residential_proxy_config(load_env(".env"))
+            if cfg and cfg.enabled:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 class BrowserSession:
     def __init__(
         self,
@@ -254,10 +275,12 @@ class BrowserSession:
 
         if self.incognito:
             use_cdp = _chrome_proxy_server_arg(self.proxy) is not None or not self.proxy
+            if _prefer_playwright_proxy_for_incognito(self.proxy):
+                use_cdp = False
             cdp_ok = use_cdp and await self._launch_incognito_via_cdp()
             if not cdp_ok:
-                if self.proxy and not use_cdp:
-                    log("[Browser] 代理含账号密码，使用 Playwright 临时 profile（支持代理鉴权）")
+                if self.proxy and (not use_cdp or _prefer_playwright_proxy_for_incognito(self.proxy)):
+                    log("[Browser] 链式/鉴权代理使用 Playwright 临时 profile（避免 ERR_PROXY_AUTH_UNSUPPORTED）")
                 await self._launch_incognito_playwright()
         else:
             launch_kwargs: dict = {
